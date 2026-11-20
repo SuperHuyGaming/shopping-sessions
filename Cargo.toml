@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 memchr = "2.7.4"
 memmap2 = "0.9.5"
+mimalloc = { version = "0.1.43", default-features = false }
 rayon = "1.10.0"
 xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
 arrow-array = "53.3.0"

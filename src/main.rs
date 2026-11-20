@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type S = &'static [u8];
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -127,6 +130,10 @@ fn map_file(p: &Path) -> S {
         return &[];
     }
     let m = unsafe { Mmap::map(&f).expect("mmap") };
+    #[cfg(unix)]
+    {
+        let _ = m.advise(memmap2::Advice::WillNeed);
+    }
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -232,11 +239,11 @@ struct Ev {
     h: u64,
     id: S,
     user: Option<S>,
-    ts: Option<i64>,
+    ts: Option<S>,
     ingest: i64,
-    et: u8,
+    et: Option<S>,
     prod: Option<S>,
-    price: i64,
+    price: Option<S>,
 }
 
 #[derive(Clone, Copy)]
@@ -253,7 +260,40 @@ struct Ck {
     id: S,
     user: Option<S>,
     camp: Option<S>,
-    ts: Option<i64>,
+    ts: Option<S>,
+}
+
+/// keys sorted by (hash, ingest, row). Returns the kept row of each distinct id: the first in (ingest, row) order.
+/// `same` compares ids; on a 64-bit hash collision (different ids, same hash) the group is re-sorted with `cmp`.
+fn dedup_keys(
+    keys: &[(u64, i64, u32)],
+    same: impl Fn(usize, usize) -> bool + Sync,
+    cmp: impl Fn(usize, usize) -> std::cmp::Ordering + Sync,
+) -> Vec<u32> {
+    let n = keys.len();
+    let starts: Vec<usize> = (0..n).into_par_iter().filter(|&i| i == 0 || keys[i].0 != keys[i - 1].0).collect();
+    starts
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(k, &s)| {
+            let e = if k + 1 < starts.len() { starts[k + 1] } else { n };
+            let g = &keys[s..e];
+            let first = g[0].2 as usize;
+            if g.iter().all(|x| same(x.2 as usize, first)) {
+                vec![g[0].2]
+            } else {
+                let mut rows: Vec<u32> = g.iter().map(|x| x.2).collect();
+                rows.sort_by(|&a, &b| cmp(a as usize, b as usize));
+                let mut out = vec![rows[0]];
+                for w in rows.windows(2) {
+                    if !same(w[0] as usize, w[1] as usize) {
+                        out.push(w[1]);
+                    }
+                }
+                out
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -399,113 +439,120 @@ fn main() {
     log(&t0, &format!("links: {} pairs, {} ids", pairs.len(), names.len()));
     let resolve = |u: S| -> S { *person_of.get(u).unwrap_or(&u) };
 
-    // ---------------- events ----------------
-    let echunks = chunks(&data.join("events"));
-    let mut evs: Vec<Ev> = echunks
-        .par_iter()
-        .flat_map_iter(|&(d, first)| {
-            let mut v = Vec::with_capacity(d.len() / 80);
-            let mut f = [None; 7];
-            for_lines(d, first, |l| {
-                if split(l, &mut f) {
-                    if let Some(id) = f[0] {
-                        let et = match f[4] {
-                            Some(b"view") => 1,
-                            Some(b"cart") => 2,
-                            Some(b"purchase") => 3,
-                            _ => 0,
-                        };
-                        v.push(Ev {
-                            h: xxh3_64(id),
-                            id,
-                            user: f[1],
-                            ts: f[2].and_then(parse_ts),
-                            ingest: f[3].and_then(parse_ts).unwrap_or(i64::MAX),
-                            et,
-                            prod: f[5],
-                            price: if et == 3 { parse_price(f[6]) } else { 0 },
-                        });
+    // ---------------- events || clicks (independent until the per-person pass) ----------------
+    let (ves, vcs) = rayon::join(
+        || {
+            let echunks = chunks(&data.join("events"));
+            // Phase 1: keep raw field slices; parse only ingest_ts (needed for dedup).
+            let evs: Vec<Ev> = echunks
+                .par_iter()
+                .flat_map_iter(|&(d, first)| {
+                    let mut v = Vec::with_capacity(d.len() / 80);
+                    let mut f = [None; 7];
+                    for_lines(d, first, |l| {
+                        if split(l, &mut f) {
+                            if let Some(id) = f[0] {
+                                v.push(Ev {
+                                    h: xxh3_64(id),
+                                    id,
+                                    user: f[1],
+                                    ts: f[2],
+                                    ingest: f[3].and_then(parse_ts).unwrap_or(i64::MAX),
+                                    et: f[4],
+                                    prod: f[5],
+                                    price: f[6],
+                                });
+                            }
+                        }
+                    });
+                    v
+                })
+                .collect();
+            log(&t0, &format!("events parsed: {}", evs.len()));
+            // Phase 2: dedup on compact keys (hash, ingest, row); exact id check inside equal-hash groups.
+            let mut keys: Vec<(u64, i64, u32)> =
+                evs.par_iter().enumerate().map(|(i, e)| (e.h, e.ingest, i as u32)).collect();
+            keys.par_sort_unstable();
+            let kept = dedup_keys(
+                &keys,
+                |a, b| evs[a].id == evs[b].id,
+                |a, b| evs[a].id.cmp(evs[b].id).then(evs[a].ingest.cmp(&evs[b].ingest)).then(a.cmp(&b)),
+            );
+            // Phase 3: validate kept copies only.
+            let mut ves: Vec<VE> = kept
+                .par_iter()
+                .filter_map(|&ix| {
+                    let e = &evs[ix as usize];
+                    let user = e.user?;
+                    let ts = parse_ts(e.ts?)?;
+                    if ts < ws || ts >= we || e.prod.is_none() {
+                        return None;
                     }
-                }
-            });
-            v
-        })
-        .collect();
-    log(&t0, &format!("events parsed: {}", evs.len()));
-    evs.par_sort_unstable_by(|a, b| a.h.cmp(&b.h).then_with(|| a.id.cmp(b.id)).then(a.ingest.cmp(&b.ingest)));
-    let n = evs.len();
-    let mut ves: Vec<VE> = (0..n)
-        .into_par_iter()
-        .filter_map(|i| {
-            let e = &evs[i];
-            if i > 0 && evs[i - 1].h == e.h && evs[i - 1].id == e.id {
-                return None; // not the kept copy
-            }
-            let user = e.user?;
-            let ts = e.ts?;
-            if ts < ws || ts >= we || e.et == 0 || e.prod.is_none() {
-                return None;
-            }
-            if e.et == 3 && e.price < 1 {
-                return None;
-            }
-            if e.ingest - ts > DAY {
-                return None;
-            }
-            let person = resolve(user);
-            let (cat, price) = if e.et == 3 {
-                (*prod_cat.get(e.prod.unwrap()).unwrap_or(&unknown), e.price)
-            } else {
-                (u32::MAX, 0)
-            };
-            Some(VE { ph: xxh3_64(person), person, ts, cat, price })
-        })
-        .collect();
-    drop(evs);
-    log(&t0, &format!("events valid: {}", ves.len()));
-    ves.par_sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)));
-
-    // ---------------- clicks ----------------
-    let cchunks = chunks(&data.join("clicks"));
-    let mut cks: Vec<Ck> = cchunks
-        .par_iter()
-        .flat_map_iter(|&(d, first)| {
-            let mut v = Vec::with_capacity(d.len() / 60);
-            let mut f = [None; 4];
-            for_lines(d, first, |l| {
-                if split(l, &mut f) {
-                    if let Some(id) = f[0] {
-                        v.push(Ck { h: xxh3_64(id), id, user: f[1], camp: f[2], ts: f[3].and_then(parse_ts) });
+                    let et = match e.et {
+                        Some(b"view") => 1,
+                        Some(b"cart") => 2,
+                        Some(b"purchase") => 3,
+                        _ => return None,
+                    };
+                    let price = if et == 3 { parse_price(e.price) } else { 0 };
+                    if et == 3 && price < 1 {
+                        return None;
                     }
-                }
+                    if e.ingest - ts > DAY {
+                        return None;
+                    }
+                    let person = resolve(user);
+                    let cat = if et == 3 { *prod_cat.get(e.prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
+                    Some(VE { ph: xxh3_64(person), person, ts, cat, price })
+                })
+                .collect();
+            drop(evs);
+            log(&t0, &format!("events valid: {}", ves.len()));
+            ves.par_sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)));
+            ves
+        },
+        || {
+            let cchunks = chunks(&data.join("clicks"));
+            let cks: Vec<Ck> = cchunks
+                .par_iter()
+                .flat_map_iter(|&(d, first)| {
+                    let mut v = Vec::with_capacity(d.len() / 60);
+                    let mut f = [None; 4];
+                    for_lines(d, first, |l| {
+                        if split(l, &mut f) {
+                            if let Some(id) = f[0] {
+                                v.push(Ck { h: xxh3_64(id), id, user: f[1], camp: f[2], ts: f[3] });
+                            }
+                        }
+                    });
+                    v
+                })
+                .collect();
+            let mut keys: Vec<(u64, i64, u32)> = cks.par_iter().enumerate().map(|(i, c)| (c.h, 0, i as u32)).collect();
+            keys.par_sort_unstable();
+            let kept = dedup_keys(&keys, |a, b| cks[a].id == cks[b].id, |a, b| cks[a].id.cmp(cks[b].id).then(a.cmp(&b)));
+            let mut vcs: Vec<VC> = kept
+                .par_iter()
+                .filter_map(|&ix| {
+                    let c = &cks[ix as usize];
+                    let user = c.user?;
+                    let ts = parse_ts(c.ts?)?;
+                    if ts < ws - WEEK || ts >= we {
+                        return None;
+                    }
+                    let camp = *camp_id.get(c.camp?)?;
+                    let person = resolve(user);
+                    Some(VC { ph: xxh3_64(person), person, ts, id: c.id, camp })
+                })
+                .collect();
+            drop(cks);
+            vcs.par_sort_unstable_by(|a, b| {
+                a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp(b.id))
             });
-            v
-        })
-        .collect();
-    cks.par_sort_unstable_by(|a, b| a.h.cmp(&b.h).then_with(|| a.id.cmp(b.id)));
-    let cn = cks.len();
-    let mut vcs: Vec<VC> = (0..cn)
-        .into_par_iter()
-        .filter_map(|i| {
-            let c = &cks[i];
-            if i > 0 && cks[i - 1].h == c.h && cks[i - 1].id == c.id {
-                return None;
-            }
-            let user = c.user?;
-            let ts = c.ts?;
-            if ts < ws - WEEK || ts >= we {
-                return None;
-            }
-            let camp = *camp_id.get(c.camp?)?;
-            let person = resolve(user);
-            Some(VC { ph: xxh3_64(person), person, ts, id: c.id, camp })
-        })
-        .collect();
-    drop(cks);
-    vcs.par_sort_unstable_by(|a, b| {
-        a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp(b.id))
-    });
-    log(&t0, &format!("clicks valid: {}", vcs.len()));
+            log(&t0, &format!("clicks valid: {}", vcs.len()));
+            vcs
+        },
+    );
 
     // ---------------- per person ----------------
     let nv = ves.len();
