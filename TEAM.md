@@ -2,4 +2,4 @@
 
 Name: GMUNVIS
 Members: Huy Truong, Khang Nguyen
-Engine: DuckDB
+Engine: Rust (native, multithreaded)

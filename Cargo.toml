@@ -1,0 +1,20 @@
+[package]
+name = "shop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memchr = "2.7.4"
+memmap2 = "0.9.5"
+rayon = "1.10.0"
+xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
+arrow-array = "53.3.0"
+arrow-schema = "53.3.0"
+parquet = { version = "53.3.0", default-features = false, features = ["arrow"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
