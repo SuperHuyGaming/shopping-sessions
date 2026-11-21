@@ -462,10 +462,73 @@ const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
+#[inline(always)]
+fn hash16(lo: u64, hi: u64) -> u64 {
+    let mut z = lo ^ hi.rotate_left(32);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
 fn parse_ts(s: S) -> Option<i64> {
-    if s.iter().all(|c| c.is_ascii_digit()) {
+    let n = s.len();
+    // ISO fast path only when s[4] is '-': an all-digit F3 value with leading zeros can also be 20 or 25 long
+    if (n == 20 || n == 25) && s[4] == b'-' {
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        // all 14 date/time digits checked in one branch-free pass
+        let dg = |i: usize| s[i].wrapping_sub(b'0');
+        let ds = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9), dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
+        if ds.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
+            return None;
+        }
+        let v = |k: usize| ds[k] as i64;
+        let y = v(0) * 1000 + v(1) * 100 + v(2) * 10 + v(3);
+        let (mo, d, h, mi, se) = (v(4) * 10 + v(5), v(6) * 10 + v(7), v(8) * 10 + v(9), v(10) * 10 + v(11), v(12) * 10 + v(13));
+        let off = if n == 20 {
+            if s[19] != b'Z' {
+                return None;
+            }
+            0
+        } else {
+            let sg = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            if s[22] != b':' {
+                return None;
+            }
+            let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            sg * (oh * 3_600_000 + om * 60_000)
+        };
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = match mo {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            1..=12 => 31,
+            _ => return None,
+        };
+        if d < 1 || d > dim || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        let days = if (DB_Y0..DB_Y0 + DB_N).contains(&y) {
+            DB[((y - DB_Y0) * 12 + mo - 1) as usize] as i64 + d - 1
+        } else {
+            days_from_civil(y, mo, d)
+        };
+        Some(days * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+    } else {
+        // F3: digits only; leading zeros allowed (strip them first, then <= 19 significant digits)
+        if n == 0 || s.iter().any(|c| !c.is_ascii_digit()) {
+            return None;
+        }
         let mut i = 0;
-        while i < s.len() && s[i] == b'0' {
+        while i < n && s[i] == b'0' {
             i += 1;
         }
         let t = &s[i..];
@@ -476,76 +539,21 @@ fn parse_ts(s: S) -> Option<i64> {
         for &c in t {
             v = v * 10 + (c - b'0') as u64;
         }
-        return if v > i64::MAX as u64 { None } else { Some(v as i64) };
+        if v > i64::MAX as u64 { None } else { Some(v as i64) }
     }
-    let n = s.len();
-    if n != 20 && n != 25 {
-        return None;
-    }
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-        return None;
-    }
-    // all 14 date/time digits checked in one branch-free pass
-    let dg = |i: usize| s[i].wrapping_sub(b'0');
-    let ds = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9), dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
-    if ds.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
-        return None;
-    }
-    let v = |k: usize| ds[k] as i64;
-    let y = v(0) * 1000 + v(1) * 100 + v(2) * 10 + v(3);
-    let (mo, d, h, mi, se) = (v(4) * 10 + v(5), v(6) * 10 + v(7), v(8) * 10 + v(9), v(10) * 10 + v(11), v(12) * 10 + v(13));
-    let off = if n == 20 {
-        if s[19] != b'Z' {
-            return None;
-        }
-        0
-    } else {
-        let sg = match s[19] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        if s[22] != b':' {
-            return None;
-        }
-        let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
-        if oh > 23 || om > 59 {
-            return None;
-        }
-        sg * (oh * 3_600_000 + om * 60_000)
-    };
-    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-    let dim = match mo {
-        2 => if leap { 29 } else { 28 },
-        4 | 6 | 9 | 11 => 30,
-        1..=12 => 31,
-        _ => return None,
-    };
-    if d < 1 || d > dim || h > 23 || mi > 59 || se > 59 {
-        return None;
-    }
-    let days = if (DB_Y0..DB_Y0 + DB_N).contains(&y) {
-        DB[((y - DB_Y0) * 12 + mo - 1) as usize] as i64 + d - 1
-    } else {
-        days_from_civil(y, mo, d)
-    };
-    Some(days * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
 }
 
 fn parse_price(s: Option<S>) -> i64 {
+    // digits only, any number of leading zeros ("0250" is 250), value 1..=10,000,000
     let Some(s) = s else { return -1 };
-    if !s.iter().all(|c| c.is_ascii_digit()) {
-        return -1;
+    let mut v: i64 = 0;
+    for &c in s {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 || v > 10_000_000 {
+            return -1; // non-digit, or already over the max (bad either way)
+        }
+        v = v * 10 + d as i64;
     }
-    let mut i = 0;
-    while i < s.len() && s[i] == b'0' {
-        i += 1;
-    }
-    let t = &s[i..];
-    if t.is_empty() || t.len() > 8 {
-        return -1;
-    }
-    let v: i64 = t.iter().fold(0, |a, &c| a * 10 + (c - b'0') as i64);
     if (1..=10_000_000).contains(&v) { v } else { -1 }
 }
 
@@ -560,16 +568,20 @@ struct EvKey {
 #[derive(Clone, Copy)]
 struct EventPayload {
     id: S,
-    pid: u32,
-    cat: u32,
-    ts: i64,
-    price: i64,
+    rec: EvRec,
 }
 
 #[derive(Clone, Copy, Default)]
 struct EvRec {
     key: u64,
     cat_price: u64,
+}
+
+impl EvRec {
+    #[inline(always)]
+    fn is_valid(&self) -> bool {
+        (self.cat_price >> 32) as u32 != INVALID
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -624,7 +636,7 @@ impl PTab {
             return;
         }
         let (lo, hi) = key16(id);
-        let mut i = (xxh3_64(id) as usize) & self.mask;
+        let mut i = (hash16(lo, hi) as usize) & self.mask;
         loop {
             let sl = &mut self.slots[i];
             if sl.len == 0 {
@@ -643,9 +655,26 @@ impl PTab {
             return self.long.get(u).copied();
         }
         let (lo, hi) = key16(u);
-        let mut i = (xxh3_64(u) as usize) & self.mask;
+        let mut i = (hash16(lo, hi) as usize) & self.mask;
         loop {
             let sl = &self.slots[i];
+            if sl.len == 0 {
+                return None;
+            }
+            if sl.len as usize == u.len() && sl.lo == lo && sl.hi == hi {
+                return Some(sl.pid);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn get_precomputed(&self, u: S, h: u64, lo: u64, hi: u64) -> Option<u32> {
+        if u.len() > 16 || u.is_empty() {
+            return self.long.get(u).copied();
+        }
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let sl = unsafe { self.slots.get_unchecked(i) };
             if sl.len == 0 {
                 return None;
             }
@@ -703,12 +732,21 @@ impl Interner {
             return *fb.entry(u).or_insert_with(|| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         }
         let (lo, hi) = key16(u);
+        self.intern_precomputed(u, hash16(lo, hi), lo, hi)
+    }
+
+    #[inline(always)]
+    fn intern_precomputed(&self, u: S, h: u64, lo: u64, hi: u64) -> u32 {
+        if u.len() > 16 || u.is_empty() {
+            let mut fb = self.fallback.lock().unwrap();
+            let next = &self.next_pid;
+            return *fb.entry(u).or_insert_with(|| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
         let len = u.len() as u32;
-        let h = xxh3_64(u);
         let mut i = (h as usize) & self.mask;
         let mut probes = 0;
         loop {
-            let sl = &self.slots[i];
+            let sl = unsafe { self.slots.get_unchecked(i) };
             let st = sl.state.load(std::sync::atomic::Ordering::Acquire);
             if st == 0 {
                 if sl.state.compare_exchange(
@@ -744,6 +782,15 @@ impl Interner {
             }
             i = (i + 1) & self.mask;
         }
+    }
+}
+
+#[inline(always)]
+fn resolve_precomputed(ptab: &PTab, interner: &Interner, u: S, h: u64, lo: u64, hi: u64) -> u32 {
+    if let Some(pid) = ptab.get_precomputed(u, h, lo, hi) {
+        pid
+    } else {
+        interner.intern_precomputed(u, h, lo, hi)
     }
 }
 
@@ -959,29 +1006,37 @@ fn main() {
     // ---------------- events || clicks (independent until the per-person pass) ----------------
     let (ev_pb, cl_pb) = rayon::join(
         || {
-            let validate = |id: S, user: Option<S>, ts: Option<S>, et: Option<S>, prod: Option<S>, price: Option<S>, ingest: i64| -> EventPayload {
-                let Some(user) = user else { return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 }; };
-                let Some(ts) = ts.and_then(parse_ts) else { return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 }; };
-                if ts < ws || ts >= we || prod.is_none() {
-                    return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 };
-                }
-                let et = match et {
-                    Some(e) if eqs(e, b"view") => 1,
-                    Some(e) if eqs(e, b"cart") => 2,
-                    Some(e) if eqs(e, b"purchase") => 3,
-                    _ => return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 },
-                };
-                let price = if et == 3 { parse_price(price) } else { 0 };
-                if et == 3 && price < 1 {
-                    return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 };
-                }
-                if ingest - ts > DAY {
-                    return EventPayload { id, pid: 0, cat: INVALID, ts: 0, price: 0 };
-                }
-                let pid = if let Some(pid) = ptab.get(user) { pid } else { interner_ref.intern(user) };
-                let cat = if et == 3 { *prod_cat.get(prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
-                EventPayload { id, pid, cat, ts, price }
+            const EVENT_BATCH: usize = 32;
+
+            #[derive(Clone, Copy)]
+            struct EventBatchItem {
+                id: S,
+                h: u64,
+                ingest: i64,
+                user: S,
+                user_h: u64,
+                lo: u64,
+                hi: u64,
+                ts: i64,
+                cat: u32,
+                price: i64,
+                valid: bool,
+            }
+
+            const DUMMY_EVENT: EventBatchItem = EventBatchItem {
+                id: &[],
+                h: 0,
+                ingest: 0,
+                user: &[],
+                user_h: 0,
+                lo: 0,
+                hi: 0,
+                ts: 0,
+                cat: INVALID,
+                price: 0,
+                valid: false,
             };
+
             let (payloads, keys_per_chunk): (Vec<Vec<EventPayload>>, Vec<Vec<Vec<EvKey>>>) = echunks
                 .par_iter()
                 .enumerate()
@@ -990,17 +1045,112 @@ fn main() {
                     let cap = d.len() / 70 / NB1 + 16;
                     let mut out: Vec<Vec<EvKey>> = (0..NB1).map(|_| Vec::with_capacity(cap)).collect();
                     let mut f = [None; 7];
+                    let mut batch = [DUMMY_EVENT; EVENT_BATCH];
+                    let mut batch_len = 0;
+
+                    let mut flush_events = |batch: &[EventBatchItem; EVENT_BATCH], len: usize, payload: &mut Vec<EventPayload>, out: &mut Vec<Vec<EvKey>>| {
+                        if len == 0 { return; }
+                        for item in &batch[..len] {
+                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                                let slot_ptab = (item.user_h as usize) & ptab.mask;
+                                let slot_intern = (item.user_h as usize) & interner_ref.mask;
+                                unsafe {
+                                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                    let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
+                                    _mm_prefetch(p1, _MM_HINT_T0);
+                                    let p2 = interner_ref.slots.as_ptr().add(slot_intern) as *const i8;
+                                    _mm_prefetch(p2, _MM_HINT_T0);
+                                }
+                            }
+                        }
+
+                        for item in &batch[..len] {
+                            let rec = if item.valid {
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let ts_rel = (item.ts - base_ms) as u64;
+                                let key = ((pid as u64) << 40) | ts_rel;
+                                let cat_price = ((item.cat as u64) << 32) | (item.price as u32 as u64);
+                                EvRec { key, cat_price }
+                            } else {
+                                EvRec { key: 0, cat_price: (INVALID as u64) << 32 }
+                            };
+                            let row = payload.len() as u32;
+                            payload.push(EventPayload { id: item.id, rec });
+                            let loc = ((ci as u64) << 32) | (row as u64);
+                            out[(item.h >> SH1) as usize].push(EvKey { h: item.h, ingest: item.ingest, loc });
+                        }
+                    };
+
                     for_lines_split::<7>(d, first, &mut f, |_l, f, _q| {
                         if let Some(id) = f[0] {
+                            if id.is_empty() { return; }
                             let h = xxh3_64(id);
                             let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
-                            let p = validate(id, f[1], f[2], f[4], f[5], f[6], ingest);
-                            let row = payload.len() as u32;
-                            payload.push(p);
-                            let loc = ((ci as u64) << 32) | (row as u64);
-                            out[(h >> SH1) as usize].push(EvKey { h, ingest, loc });
+
+                            let mut valid = false;
+                            let mut user: S = &[];
+                            let mut user_h = 0u64;
+                            let mut lo = 0u64;
+                            let mut hi = 0u64;
+                            let mut ts = 0i64;
+                            let mut cat = INVALID;
+                            let mut price = 0i64;
+
+                            if let (Some(u), Some(t_str), Some(e_str), Some(prod)) = (f[1], f[2], f[4], f[5]) {
+                                if !u.is_empty() && !prod.is_empty() {
+                                    if let Some(t) = parse_ts(t_str) {
+                                        if t >= ws && t < we && ingest - t <= DAY {
+                                            let et = if eqs(e_str, b"view") {
+                                                1
+                                            } else if eqs(e_str, b"cart") {
+                                                2
+                                            } else if eqs(e_str, b"purchase") {
+                                                3
+                                            } else {
+                                                0
+                                            };
+                                            if et != 0 {
+                                                let pr = if et == 3 { parse_price(f[6]) } else { 0 };
+                                                if et != 3 || pr >= 1 {
+                                                    user = u;
+                                                    let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                    lo = l;
+                                                    hi = h_val;
+                                                    user_h = hash16(lo, hi);
+                                                    ts = t;
+                                                    price = pr;
+                                                    cat = if et == 3 { *prod_cat.get(prod).unwrap_or(&unknown) } else { u32::MAX };
+                                                    valid = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            batch[batch_len] = EventBatchItem {
+                                id,
+                                h,
+                                ingest,
+                                user,
+                                user_h,
+                                lo,
+                                hi,
+                                ts,
+                                cat,
+                                price,
+                                valid,
+                            };
+                            batch_len += 1;
+                            if batch_len == EVENT_BATCH {
+                                flush_events(&batch, batch_len, &mut payload, &mut out);
+                                batch_len = 0;
+                            }
                         }
                     });
+                    if batch_len > 0 {
+                        flush_events(&batch, batch_len, &mut payload, &mut out);
+                    }
                     (payload, out)
                 })
                 .unzip();
@@ -1018,12 +1168,9 @@ fn main() {
                     let mut surv = Vec::with_capacity(n);
                     let mut cnt = [0u32; NB2];
                     let mut emit = |p: &EventPayload| {
-                        let ts_rel = (p.ts - base_ms) as u64;
-                        let key = ((p.pid as u64) << 40) | ts_rel;
-                        let cat_price = ((p.cat as u64) << 32) | (p.price as u32 as u64);
-                        let pb_idx = (p.pid & 255) as usize;
+                        let pb_idx = ((p.rec.key >> 40) & 255) as usize;
                         cnt[pb_idx] += 1;
-                        surv.push(EvRec { key, cat_price });
+                        surv.push(p.rec);
                     };
                     let mut s = 0;
                     while s < keys.len() {
@@ -1036,7 +1183,7 @@ fn main() {
                             let ci = (g[0].loc >> 32) as usize;
                             let row = (g[0].loc as u32) as usize;
                             let p = &payloads_ref[ci][row];
-                            if p.cat != INVALID {
+                            if p.rec.is_valid() {
                                 emit(p);
                             }
                         } else {
@@ -1050,7 +1197,7 @@ fn main() {
                             });
                             if all_same {
                                 let p0 = &payloads_ref[ci0][row0];
-                                if p0.cat != INVALID {
+                                if p0.rec.is_valid() {
                                     emit(p0);
                                 }
                             } else {
@@ -1060,14 +1207,14 @@ fn main() {
                                     px.id.cmp(py.id).then(x.ingest.cmp(&y.ingest)).then(x.loc.cmp(&y.loc))
                                 });
                                 let p0 = &payloads_ref[(g[0].loc >> 32) as usize][(g[0].loc as u32) as usize];
-                                if p0.cat != INVALID {
+                                if p0.rec.is_valid() {
                                     emit(p0);
                                 }
                                 for w in 1..g.len() {
                                     let prev = &payloads_ref[(g[w - 1].loc >> 32) as usize][(g[w - 1].loc as u32) as usize];
                                     let curr = &payloads_ref[(g[w].loc >> 32) as usize][(g[w].loc as u32) as usize];
                                     if !eqs(curr.id, prev.id) {
-                                        if curr.cat != INVALID {
+                                        if curr.rec.is_valid() {
                                             emit(curr);
                                         }
                                     }
@@ -1130,33 +1277,118 @@ fn main() {
             pb
         },
         || {
-            let validate = |id: S, user: Option<S>, camp: Option<S>, ts: Option<S>| -> Option<CkRec> {
-                let user = user?;
-                let ts = parse_ts(ts?)?;
-                if ts < ws - WEEK || ts >= we {
-                    return None;
-                }
-                let camp = *camp_id.get(camp?)?;
-                let pid = if let Some(pid) = ptab.get(user) { pid } else { interner_ref.intern(user) };
-                let ts_rel = (ts - base_ms) as u64;
-                let key = ((pid as u64) << 40) | ts_rel;
-                Some(CkRec { key, camp, id })
+            const CLICK_BATCH: usize = 32;
+
+            #[derive(Clone, Copy)]
+            struct ClickBatchItem {
+                id: S,
+                user: S,
+                user_h: u64,
+                lo: u64,
+                hi: u64,
+                camp: u32,
+                ts: i64,
+                valid: bool,
+            }
+
+            const DUMMY_CLICK: ClickBatchItem = ClickBatchItem {
+                id: &[],
+                user: &[],
+                user_h: 0,
+                lo: 0,
+                hi: 0,
+                camp: 0,
+                ts: 0,
+                valid: false,
             };
+
             let (survivors, counts): (Vec<Vec<CkRec>>, Vec<[u32; NB2]>) = cchunks
                 .par_iter()
                 .map(|&(d, first)| {
                     let mut surv: Vec<CkRec> = Vec::with_capacity(d.len() / 50 + 16);
                     let mut cnt = [0u32; NB2];
                     let mut f = [None; 4];
+                    let mut batch = [DUMMY_CLICK; CLICK_BATCH];
+                    let mut batch_len = 0;
+
+                    let mut flush_clicks = |batch: &[ClickBatchItem; CLICK_BATCH], len: usize, cnt: &mut [u32; NB2], surv: &mut Vec<CkRec>| {
+                        if len == 0 { return; }
+                        for item in &batch[..len] {
+                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                                let slot_ptab = (item.user_h as usize) & ptab.mask;
+                                let slot_intern = (item.user_h as usize) & interner_ref.mask;
+                                unsafe {
+                                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                    let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
+                                    _mm_prefetch(p1, _MM_HINT_T0);
+                                    let p2 = interner_ref.slots.as_ptr().add(slot_intern) as *const i8;
+                                    _mm_prefetch(p2, _MM_HINT_T0);
+                                }
+                            }
+                        }
+
+                        for item in &batch[..len] {
+                            if item.valid {
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let ts_rel = (item.ts - base_ms) as u64;
+                                let key = ((pid as u64) << 40) | ts_rel;
+                                let p = (pid & 255) as usize;
+                                cnt[p] += 1;
+                                surv.push(CkRec { key, camp: item.camp, id: item.id });
+                            }
+                        }
+                    };
+
                     for_lines_split::<4>(d, first, &mut f, |_l, f, _q| {
                         if let Some(id) = f[0] {
-                            if let Some(ck) = validate(id, f[1], f[2], f[3]) {
-                                let p = ((ck.key >> 40) & 255) as usize;
-                                cnt[p] += 1;
-                                surv.push(ck);
+                            if id.is_empty() { return; }
+                            let mut valid = false;
+                            let mut user: S = &[];
+                            let mut user_h = 0u64;
+                            let mut lo = 0u64;
+                            let mut hi = 0u64;
+                            let mut camp = 0u32;
+                            let mut ts = 0i64;
+
+                            if let (Some(u), Some(c), Some(t_str)) = (f[1], f[2], f[3]) {
+                                if !u.is_empty() {
+                                    if let Some(t) = parse_ts(t_str) {
+                                        if t >= ws - WEEK && t < we {
+                                            if let Some(&cmp) = camp_id.get(c) {
+                                                user = u;
+                                                let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                lo = l;
+                                                hi = h_val;
+                                                user_h = hash16(lo, hi);
+                                                camp = cmp;
+                                                ts = t;
+                                                valid = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            batch[batch_len] = ClickBatchItem {
+                                id,
+                                user,
+                                user_h,
+                                lo,
+                                hi,
+                                camp,
+                                ts,
+                                valid,
+                            };
+                            batch_len += 1;
+                            if batch_len == CLICK_BATCH {
+                                flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
+                                batch_len = 0;
                             }
                         }
                     });
+                    if batch_len > 0 {
+                        flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
+                    }
                     (surv, cnt)
                 })
                 .unzip();
