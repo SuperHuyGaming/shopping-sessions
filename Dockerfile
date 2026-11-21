@@ -1,5 +1,5 @@
 # Shopping Sessions: native Rust engine. Scorers are Intel Xeon (Cascade Lake+, AVX-512) -> x86-64-v4.
-FROM rust:1.85-slim-bookworm AS build
+FROM rust:1.89-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src

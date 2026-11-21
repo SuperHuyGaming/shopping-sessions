@@ -59,7 +59,6 @@ fn fin(f: S, quotes: u32) -> Result<Option<S>, ()> {
         Ok(if f.is_empty() { None } else { Some(f) })
     } else {
         let n = f.len();
-        // quotes only allowed as one pair around the whole field
         if quotes == 2 && n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
             Ok(if n == 2 { None } else { Some(&f[1..n - 1]) })
         } else {
@@ -68,18 +67,16 @@ fn fin(f: S, quotes: u32) -> Result<Option<S>, ()> {
     }
 }
 
-/// Split a line into exactly out.len() fields per rules.md; false = malformed. Single pass, no per-field calls.
+/// Scalar split: single pass counting quotes per field.
 #[inline]
-fn split(line: S, out: &mut [Option<S>]) -> bool {
+fn split_scalar(line: S, out: &mut [Option<S>]) -> bool {
     let n = out.len();
     let mut k = 0;
     let mut start = 0;
     let mut q = 0u32;
     for (i, &c) in line.iter().enumerate() {
         if c == b',' {
-            if k >= n {
-                return false;
-            }
+            if k >= n { return false; }
             match fin(&line[start..i], q) {
                 Ok(v) => out[k] = v,
                 Err(_) => return false,
@@ -91,9 +88,7 @@ fn split(line: S, out: &mut [Option<S>]) -> bool {
             q += 1;
         }
     }
-    if k >= n {
-        return false;
-    }
+    if k >= n { return false; }
     match fin(&line[start..], q) {
         Ok(v) => out[k] = v,
         Err(_) => return false,
@@ -101,6 +96,274 @@ fn split(line: S, out: &mut [Option<S>]) -> bool {
     k + 1 == n
 }
 
+#[inline(always)]
+fn populate_out_const<const NF: usize>(
+    data: S,
+    line_start: usize,
+    commas: &[u32; 16],
+    line_end: usize,
+    out: &mut [Option<S>],
+) {
+    if NF == 7 {
+        let c0 = commas[0] as usize;
+        let c1 = commas[1] as usize;
+        let c2 = commas[2] as usize;
+        let c3 = commas[3] as usize;
+        let c4 = commas[4] as usize;
+        let c5 = commas[5] as usize;
+        out[0] = if line_start == c0 { None } else { Some(&data[line_start..c0]) };
+        out[1] = if c0 + 1 == c1 { None } else { Some(&data[c0 + 1..c1]) };
+        out[2] = if c1 + 1 == c2 { None } else { Some(&data[c1 + 1..c2]) };
+        out[3] = if c2 + 1 == c3 { None } else { Some(&data[c2 + 1..c3]) };
+        out[4] = if c3 + 1 == c4 { None } else { Some(&data[c3 + 1..c4]) };
+        out[5] = if c4 + 1 == c5 { None } else { Some(&data[c4 + 1..c5]) };
+        out[6] = if c5 + 1 == line_end { None } else { Some(&data[c5 + 1..line_end]) };
+    } else if NF == 4 {
+        let c0 = commas[0] as usize;
+        let c1 = commas[1] as usize;
+        let c2 = commas[2] as usize;
+        out[0] = if line_start == c0 { None } else { Some(&data[line_start..c0]) };
+        out[1] = if c0 + 1 == c1 { None } else { Some(&data[c0 + 1..c1]) };
+        out[2] = if c1 + 1 == c2 { None } else { Some(&data[c1 + 1..c2]) };
+        out[3] = if c2 + 1 == line_end { None } else { Some(&data[c2 + 1..line_end]) };
+    } else if NF == 2 {
+        let c0 = commas[0] as usize;
+        out[0] = if line_start == c0 { None } else { Some(&data[line_start..c0]) };
+        out[1] = if c0 + 1 == line_end { None } else { Some(&data[c0 + 1..line_end]) };
+    } else {
+        let mut prev = line_start;
+        for k in 0..NF - 1 {
+            let cp = commas[k] as usize;
+            out[k] = if prev == cp { None } else { Some(&data[prev..cp]) };
+            prev = cp + 1;
+        }
+        out[NF - 1] = if prev == line_end { None } else { Some(&data[prev..line_end]) };
+    }
+}
+
+/// AVX-512 structural scan: 64-byte blocks, masks for \n, ',', '"'.
+/// Lines without quotes populate `out` directly from comma mask positions.
+/// Lines with quotes take the exact slow path `split_scalar`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw")]
+unsafe fn simd_for_lines<const NF: usize>(
+    data: S,
+    skip_header: bool,
+    out: &mut [Option<S>],
+    mut handler: impl FnMut(S, &mut [Option<S>], bool),
+) {
+    use std::arch::x86_64::*;
+
+    let len = data.len();
+    let ptr = data.as_ptr();
+
+    let nl_v = _mm512_set1_epi8(b'\n' as i8);
+    let cm_v = _mm512_set1_epi8(b',' as i8);
+    let qt_v = _mm512_set1_epi8(b'"' as i8);
+
+    let mut line_start: usize = 0;
+    let mut skipping = skip_header;
+
+    let mut has_quotes = false;
+    let mut commas = [0u32; 16];
+    let mut ncommas: usize = 0;
+
+    let mut pos: usize = 0;
+
+    while pos + 64 <= len {
+        let chunk = _mm512_loadu_si512(ptr.add(pos) as *const _);
+        let nl_mask = _mm512_cmpeq_epi8_mask(chunk, nl_v);
+        let cm_mask = _mm512_cmpeq_epi8_mask(chunk, cm_v);
+        let qt_mask = _mm512_cmpeq_epi8_mask(chunk, qt_v);
+
+        if nl_mask == 0 {
+            if qt_mask != 0 {
+                has_quotes = true;
+            }
+            if !skipping && !has_quotes {
+                let mut m = cm_mask;
+                while m != 0 {
+                    let bit = m.trailing_zeros();
+                    if ncommas < 16 {
+                        commas[ncommas] = (pos + bit as usize) as u32;
+                    }
+                    ncommas += 1;
+                    m &= m - 1;
+                }
+            }
+            pos += 64;
+            continue;
+        }
+
+        let mut cur_nl = nl_mask;
+        let mut cur_cm = cm_mask;
+        let mut cur_qt = qt_mask;
+
+        while cur_nl != 0 {
+            let nl_bit = cur_nl.trailing_zeros();
+            let nl_pos = pos + nl_bit as usize;
+
+            let before_nl = (1u64 << nl_bit) - 1;
+            let seg_cm = cur_cm & before_nl;
+            let seg_qt = cur_qt & before_nl;
+
+            if seg_qt != 0 {
+                has_quotes = true;
+            }
+
+            if skipping {
+                skipping = false;
+            } else {
+                let line = &data[line_start..nl_pos];
+                if has_quotes {
+                    if split_scalar(line, out) {
+                        handler(line, out, true);
+                    }
+                } else {
+                    let mut m = seg_cm;
+                    while m != 0 {
+                        let bit = m.trailing_zeros();
+                        if ncommas < 16 {
+                            commas[ncommas] = (pos + bit as usize) as u32;
+                        }
+                        ncommas += 1;
+                        m &= m - 1;
+                    }
+                    if ncommas + 1 == NF {
+                        populate_out_const::<NF>(data, line_start, &commas, nl_pos, out);
+                        handler(line, out, false);
+                    }
+                }
+            }
+
+            line_start = nl_pos + 1;
+            has_quotes = false;
+            ncommas = 0;
+
+            let clear_mask = if nl_bit < 63 { !((1u64 << (nl_bit + 1)) - 1) } else { 0 };
+            cur_cm &= clear_mask;
+            cur_qt &= clear_mask;
+            cur_nl &= cur_nl - 1;
+        }
+
+        if cur_qt != 0 {
+            has_quotes = true;
+        }
+        if !skipping && !has_quotes {
+            let mut m = cur_cm;
+            while m != 0 {
+                let bit = m.trailing_zeros();
+                if ncommas < 16 {
+                    commas[ncommas] = (pos + bit as usize) as u32;
+                }
+                ncommas += 1;
+                m &= m - 1;
+            }
+        }
+
+        pos += 64;
+    }
+
+    // Scalar fallback for tail < 64 bytes
+    while pos < len {
+        let c = data[pos];
+        if c == b'\n' {
+            if skipping {
+                skipping = false;
+            } else {
+                let line = &data[line_start..pos];
+                if has_quotes {
+                    if split_scalar(line, out) {
+                        handler(line, out, true);
+                    }
+                } else if ncommas + 1 == NF {
+                    populate_out_const::<NF>(data, line_start, &commas, pos, out);
+                    handler(line, out, false);
+                }
+            }
+            line_start = pos + 1;
+            has_quotes = false;
+            ncommas = 0;
+        } else if c == b'"' {
+            has_quotes = true;
+        } else if c == b',' && !skipping && !has_quotes {
+            if ncommas < 16 {
+                commas[ncommas] = pos as u32;
+            }
+            ncommas += 1;
+        }
+        pos += 1;
+    }
+
+    if line_start < len && !skipping {
+        let line = &data[line_start..];
+        if has_quotes {
+            if split_scalar(line, out) {
+                handler(line, out, true);
+            }
+        } else if ncommas + 1 == NF {
+            populate_out_const::<NF>(data, line_start, &commas, len, out);
+            handler(line, out, false);
+        }
+    }
+}
+
+#[inline(always)]
+fn for_lines_split<const NF: usize>(
+    d: S,
+    skip_header: bool,
+    out: &mut [Option<S>],
+    handler: impl FnMut(S, &mut [Option<S>], bool),
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(target_feature = "avx512f")]
+        {
+            unsafe { simd_for_lines::<NF>(d, skip_header, out, handler); }
+            return;
+        }
+        #[cfg(not(target_feature = "avx512f"))]
+        {
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                unsafe { simd_for_lines::<NF>(d, skip_header, out, handler); }
+                return;
+            }
+        }
+    }
+    for_lines_split_scalar(d, skip_header, NF, out, handler);
+}
+
+fn for_lines_split_scalar(
+    d: S,
+    skip_header: bool,
+    _nfields: usize,
+    out: &mut [Option<S>],
+    mut handler: impl FnMut(S, &mut [Option<S>], bool),
+) {
+    let mut start = 0;
+    let mut skip = skip_header;
+    for p in memchr_iter(b'\n', d) {
+        if skip {
+            skip = false;
+        } else {
+            let line = &d[start..p];
+            if split_scalar(line, out) {
+                let has_q = line.iter().any(|&c| c == b'"');
+                handler(line, out, has_q);
+            }
+        }
+        start = p + 1;
+    }
+    if start < d.len() && !skip {
+        let line = &d[start..];
+        if split_scalar(line, out) {
+            let has_q = line.iter().any(|&c| c == b'"');
+            handler(line, out, has_q);
+        }
+    }
+}
+
+// Keep the old for_lines for simple 2-field tables (products, campaigns)
 fn for_lines(d: S, skip_header: bool, mut f: impl FnMut(S)) {
     let mut start = 0;
     let mut skip = skip_header;
@@ -115,6 +378,11 @@ fn for_lines(d: S, skip_header: bool, mut f: impl FnMut(S)) {
     if start < d.len() && !skip {
         f(&d[start..]);
     }
+}
+
+#[inline]
+fn split(line: S, out: &mut [Option<S>]) -> bool {
+    split_scalar(line, out)
 }
 
 /// Memory-map every *.csv in dir and cut it into ~CHUNK pieces at line boundaries. bool = piece starts the file.
@@ -170,7 +438,20 @@ fn d2(s: &[u8], i: usize) -> Option<i64> {
     }
 }
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const DB_Y0: i64 = 1900;
+const DB_N: i64 = 300;
+/// days_from_civil(y, m, 1) for y in DB_Y0..DB_Y0+DB_N, built at compile time
+const DB: [i32; (DB_N * 12) as usize] = {
+    let mut t = [0i32; (DB_N * 12) as usize];
+    let mut i = 0;
+    while i < (DB_N * 12) as usize {
+        t[i] = days_from_civil(DB_Y0 + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
+
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -203,8 +484,15 @@ fn parse_ts(s: S) -> Option<i64> {
     if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
         return None;
     }
-    let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let (mo, d, h, mi, se) = (d2(s, 5)?, d2(s, 8)?, d2(s, 11)?, d2(s, 14)?, d2(s, 17)?);
+    // all 14 date/time digits checked in one branch-free pass
+    let dg = |i: usize| s[i].wrapping_sub(b'0');
+    let ds = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9), dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
+    if ds.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
+        return None;
+    }
+    let v = |k: usize| ds[k] as i64;
+    let y = v(0) * 1000 + v(1) * 100 + v(2) * 10 + v(3);
+    let (mo, d, h, mi, se) = (v(4) * 10 + v(5), v(6) * 10 + v(7), v(8) * 10 + v(9), v(10) * 10 + v(11), v(12) * 10 + v(13));
     let off = if n == 20 {
         if s[19] != b'Z' {
             return None;
@@ -235,7 +523,12 @@ fn parse_ts(s: S) -> Option<i64> {
     if d < 1 || d > dim || h > 23 || mi > 59 || se > 59 {
         return None;
     }
-    Some(days_from_civil(y, mo, d) * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+    let days = if (DB_Y0..DB_Y0 + DB_N).contains(&y) {
+        DB[((y - DB_Y0) * 12 + mo - 1) as usize] as i64 + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    };
+    Some(days * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
 }
 
 fn parse_price(s: Option<S>) -> i64 {
@@ -308,6 +601,82 @@ fn fix_ph<T>(v: &mut [T], ph: impl Fn(&T) -> u64, same: impl Fn(&T, &T) -> bool,
             v[s..e].sort_by(&cmp);
         }
         s = e;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    lo: u64,
+    hi: u64,
+    ph: u64,
+    person: S,
+    len: u32,
+}
+/// user id -> (hash of person, person). Ids up to 16 bytes are compared inline (no pointer chase, no memcmp).
+/// (lo, hi, len) identifies the id exactly: bytes [0..8] and [len-8..len] for len >= 8, else packed bytes.
+struct PTab {
+    mask: usize,
+    slots: Vec<Slot>,
+    long: Map<S, S>,
+}
+/// exact byte-slice equality without a libc memcmp call for the common short ids (<= 16 bytes)
+#[inline(always)]
+fn eqs(a: S, b: S) -> bool {
+    a.len() == b.len() && if a.len() <= 16 { key16(a) == key16(b) } else { a == b }
+}
+#[inline(always)]
+fn key16(s: S) -> (u64, u64) {
+    let n = s.len();
+    if n >= 8 {
+        (u64::from_le_bytes(s[..8].try_into().unwrap()), u64::from_le_bytes(s[n - 8..].try_into().unwrap()))
+    } else {
+        let mut x = 0u64;
+        for (i, &c) in s.iter().enumerate() {
+            x |= (c as u64) << (8 * i);
+        }
+        (x, 0)
+    }
+}
+impl PTab {
+    fn insert(&mut self, id: S, person: S) {
+        if id.len() > 16 || id.is_empty() {
+            self.long.insert(id, person);
+            return;
+        }
+        let (lo, hi) = key16(id);
+        let mut i = (xxh3_64(id) as usize) & self.mask;
+        loop {
+            let sl = &mut self.slots[i];
+            if sl.len == 0 {
+                *sl = Slot { lo, hi, ph: xxh3_64(person), person, len: id.len() as u32 };
+                return;
+            }
+            if sl.len as usize == id.len() && sl.lo == lo && sl.hi == hi {
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    /// (xxh3(person), person); unlinked ids are their own person.
+    #[inline(always)]
+    fn get(&self, u: S) -> (u64, S) {
+        let h = xxh3_64(u);
+        if u.len() > 16 || u.is_empty() {
+            let p = *self.long.get(u).unwrap_or(&u);
+            return (xxh3_64(p), p);
+        }
+        let (lo, hi) = key16(u);
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let sl = &self.slots[i];
+            if sl.len == 0 {
+                return (h, u);
+            }
+            if sl.len as usize == u.len() && sl.lo == lo && sl.hi == hi {
+                return (sl.ph, sl.person);
+            }
+            i = (i + 1) & self.mask;
+        }
     }
 }
 
@@ -485,15 +854,19 @@ fn main() {
             }
         }
     }
-    let mut person_of: Map<S, S> = Map::default();
-    person_of.reserve(names.len());
+    // flat open-addressing table: id bytes inline (<=16 B), person + its hash stored in the slot
+    let mut cap = 1usize;
+    while cap < names.len() * 2 + 16 {
+        cap <<= 1;
+    }
+    let mut ptab = PTab { mask: cap - 1, slots: vec![Slot::default(); cap], long: Map::default() };
     for i in 0..names.len() as u32 {
         let r = find(&mut parent, i);
-        person_of.insert(names[i as usize], names[r as usize]);
+        ptab.insert(names[i as usize], names[r as usize]);
     }
-    let person_of = Arc::new(person_of);
     log(&t0, &format!("links: {} pairs, {} ids", pairs.len(), names.len()));
-    let resolve = |u: S| -> S { *person_of.get(u).unwrap_or(&u) };
+    let ptab = &ptab;
+
 
     // ---------------- events || clicks (independent until the per-person pass) ----------------
     let (ves, vcs) = rayon::join(
@@ -507,9 +880,9 @@ fn main() {
                     return None;
                 }
                 let et = match et {
-                    Some(b"view") => 1,
-                    Some(b"cart") => 2,
-                    Some(b"purchase") => 3,
+                    Some(e) if eqs(e, b"view") => 1,
+                    Some(e) if eqs(e, b"cart") => 2,
+                    Some(e) if eqs(e, b"purchase") => 3,
                     _ => return None,
                 };
                 let price = if et == 3 { parse_price(price) } else { 0 };
@@ -519,9 +892,9 @@ fn main() {
                 if ingest - ts > DAY {
                     return None;
                 }
-                let person = resolve(user);
+                let (ph, person) = ptab.get(user);
                 let cat = if et == 3 { *prod_cat.get(prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
-                Some(VE { ph: xxh3_64(person), person, ts, cat, price })
+                Some(VE { ph, person, ts, cat, price })
             };
             let parts: Vec<Vec<Vec<Rec>>> = echunks
                 .par_iter()
@@ -531,8 +904,8 @@ fn main() {
                     let mut out: Vec<Vec<Rec>> = (0..NB1).map(|_| Vec::with_capacity(cap)).collect();
                     let mut f = [None; 7];
                     let mut ln: u64 = 0;
-                    for_lines(d, first, |l| {
-                        if split(l, &mut f) {
+                    for_lines_split::<7>(d, first, &mut f, |_l, f, _q| {
+                        {
                             if let Some(id) = f[0] {
                                 let h = xxh3_64(id);
                                 let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
@@ -570,13 +943,13 @@ fn main() {
                             e += 1;
                         }
                         let g = &mut keys[s..e];
-                        if g.iter().all(|k| k.3.id == g[0].3.id) {
+                        if g.len() == 1 || g.iter().all(|k| eqs(k.3.id, g[0].3.id)) {
                             emit(g[0].3);
                         } else {
                             g.sort_by(|x, y| x.3.id.cmp(y.3.id).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
                             emit(g[0].3);
                             for w in 1..g.len() {
-                                if g[w].3.id != g[w - 1].3.id {
+                                if !eqs(g[w].3.id, g[w - 1].3.id) {
                                     emit(g[w].3);
                                 }
                             }
@@ -597,7 +970,7 @@ fn main() {
                         v.extend_from_slice(&o[p]);
                     }
                     v.sort_unstable_by_key(|x| (x.ph, x.ts));
-                    fix_ph(&mut v, |x| x.ph, |a, b| a.person == b.person, |a, b| a.person.cmp(b.person).then(a.ts.cmp(&b.ts)));
+                    fix_ph(&mut v, |x| x.ph, |a, b| eqs(a.person, b.person), |a, b| a.person.cmp(b.person).then(a.ts.cmp(&b.ts)));
                     v
                 })
                 .collect();
@@ -616,8 +989,8 @@ fn main() {
                     return None;
                 }
                 let camp = *camp_id.get(camp?)?;
-                let person = resolve(user);
-                Some(VC { ph: xxh3_64(person), person, ts, id, camp })
+                let (ph, person) = ptab.get(user);
+                Some(VC { ph, person, ts, id, camp })
             };
             let parts: Vec<Vec<Vec<VC>>> = cchunks
                 .par_iter()
@@ -625,8 +998,8 @@ fn main() {
                     let cap = d.len() / 50 / NB2 + 16;
                     let mut out: Vec<Vec<VC>> = (0..NB2).map(|_| Vec::with_capacity(cap)).collect();
                     let mut f = [None; 4];
-                    for_lines(d, first, |l| {
-                        if split(l, &mut f) {
+                    for_lines_split::<4>(d, first, &mut f, |_l, f, _q| {
+                        {
                             if let Some(id) = f[0] {
                                 if let Some(vc) = validate(id, f[1], f[2], f[3]) {
                                     out[(vc.ph >> SH2) as usize].push(vc);
@@ -646,10 +1019,10 @@ fn main() {
                         v.extend_from_slice(&o[p]);
                     }
                     v.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| a.id.cmp(b.id)));
-                    fix_ph(&mut v, |x| x.ph, |a, b| a.person == b.person, |a, b| {
+                    fix_ph(&mut v, |x| x.ph, |a, b| eqs(a.person, b.person), |a, b| {
                         a.person.cmp(b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp(b.id))
                     });
-                    v.dedup_by(|a, b| a.id == b.id && a.ts == b.ts && a.person == b.person);
+                    v.dedup_by(|a, b| a.ts == b.ts && eqs(a.id, b.id) && eqs(a.person, b.person));
                     v
                 })
                 .collect();
@@ -666,7 +1039,7 @@ fn main() {
             let mut g = Vec::new();
             let mut s0 = 0;
             for i in 1..=v.len() {
-                if i == v.len() || v[i].ph != v[i - 1].ph || v[i].person != v[i - 1].person {
+                if i == v.len() || v[i].ph != v[i - 1].ph || !eqs(v[i].person, v[i - 1].person) {
                     g.push(&v[s0..i]);
                     s0 = i;
                 }
