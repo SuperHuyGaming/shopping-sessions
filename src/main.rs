@@ -291,6 +291,26 @@ const SH1: u32 = 64 - 9;
 const NB2: usize = 256;
 const SH2: u32 = 64 - 8;
 
+/// v is sorted by ph first. Inside each equal-ph run that mixes different people (64-bit hash collision),
+/// re-sort that run with the exact comparator so each person's rows are contiguous and ordered.
+fn fix_ph<T>(v: &mut [T], ph: impl Fn(&T) -> u64, same: impl Fn(&T, &T) -> bool, cmp: impl Fn(&T, &T) -> std::cmp::Ordering) {
+    let mut s = 0;
+    while s < v.len() {
+        let mut e = s + 1;
+        let mut mixed = false;
+        while e < v.len() && ph(&v[e]) == ph(&v[s]) {
+            if !same(&v[e], &v[s]) {
+                mixed = true;
+            }
+            e += 1;
+        }
+        if mixed {
+            v[s..e].sort_by(&cmp);
+        }
+        s = e;
+    }
+}
+
 struct Ck {
     h: u64,
     id: S,
@@ -576,7 +596,8 @@ fn main() {
                     for o in &outs {
                         v.extend_from_slice(&o[p]);
                     }
-                    v.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)));
+                    v.sort_unstable_by_key(|x| (x.ph, x.ts));
+                    fix_ph(&mut v, |x| x.ph, |a, b| a.person == b.person, |a, b| a.person.cmp(b.person).then(a.ts.cmp(&b.ts)));
                     v
                 })
                 .collect();
@@ -586,44 +607,55 @@ fn main() {
         },
         || {
             let cchunks = chunks(&data.join("clicks"));
-            let cks: Vec<Ck> = cchunks
+            // v6: BRIEF: "Copies of a click have identical values, so keep any one". So: parse + validate inline,
+            // scatter straight into person buckets, sort locally, drop adjacent identical copies.
+            let validate = |id: S, user: Option<S>, camp: Option<S>, ts: Option<S>| -> Option<VC> {
+                let user = user?;
+                let ts = parse_ts(ts?)?;
+                if ts < ws - WEEK || ts >= we {
+                    return None;
+                }
+                let camp = *camp_id.get(camp?)?;
+                let person = resolve(user);
+                Some(VC { ph: xxh3_64(person), person, ts, id, camp })
+            };
+            let parts: Vec<Vec<Vec<VC>>> = cchunks
                 .par_iter()
-                .flat_map_iter(|&(d, first)| {
-                    let mut v = Vec::with_capacity(d.len() / 60);
+                .map(|&(d, first)| {
+                    let cap = d.len() / 50 / NB2 + 16;
+                    let mut out: Vec<Vec<VC>> = (0..NB2).map(|_| Vec::with_capacity(cap)).collect();
                     let mut f = [None; 4];
                     for_lines(d, first, |l| {
                         if split(l, &mut f) {
                             if let Some(id) = f[0] {
-                                v.push(Ck { h: xxh3_64(id), id, user: f[1], camp: f[2], ts: f[3] });
+                                if let Some(vc) = validate(id, f[1], f[2], f[3]) {
+                                    out[(vc.ph >> SH2) as usize].push(vc);
+                                }
                             }
                         }
                     });
+                    out
+                })
+                .collect();
+            let cb: Vec<Vec<VC>> = (0..NB2)
+                .into_par_iter()
+                .map(|p| {
+                    let n: usize = parts.iter().map(|o| o[p].len()).sum();
+                    let mut v: Vec<VC> = Vec::with_capacity(n);
+                    for o in &parts {
+                        v.extend_from_slice(&o[p]);
+                    }
+                    v.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| a.id.cmp(b.id)));
+                    fix_ph(&mut v, |x| x.ph, |a, b| a.person == b.person, |a, b| {
+                        a.person.cmp(b.person).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp(b.id))
+                    });
+                    v.dedup_by(|a, b| a.id == b.id && a.ts == b.ts && a.person == b.person);
                     v
                 })
                 .collect();
-            let mut keys: Vec<(u64, i64, u32)> = cks.par_iter().enumerate().map(|(i, c)| (c.h, 0, i as u32)).collect();
-            keys.par_sort_unstable();
-            let kept = dedup_keys(&keys, |a, b| cks[a].id == cks[b].id, |a, b| cks[a].id.cmp(cks[b].id).then(a.cmp(&b)));
-            let mut vcs: Vec<VC> = kept
-                .par_iter()
-                .filter_map(|&ix| {
-                    let c = &cks[ix as usize];
-                    let user = c.user?;
-                    let ts = parse_ts(c.ts?)?;
-                    if ts < ws - WEEK || ts >= we {
-                        return None;
-                    }
-                    let camp = *camp_id.get(c.camp?)?;
-                    let person = resolve(user);
-                    Some(VC { ph: xxh3_64(person), person, ts, id: c.id, camp })
-                })
-                .collect();
-            drop(cks);
-            vcs.par_sort_unstable_by(|a, b| {
-                a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)).then_with(|| a.id.cmp(b.id))
-            });
-            log(&t0, &format!("clicks valid: {}", vcs.len()));
-            vcs
+            drop(parts);
+            log(&t0, &format!("clicks valid: {}", cb.iter().map(|v| v.len()).sum::<usize>()));
+            cb
         },
     );
 
@@ -666,9 +698,10 @@ fn main() {
         .fold(new_acc, |mut acc, ev: &&[VE]| {
             let ev: &[VE] = ev;
             let key = (ev[0].ph, ev[0].person);
-            let lo = vcs_ref.partition_point(|c| (c.ph, c.person) < key);
-            let hi = lo + vcs_ref[lo..].partition_point(|c| (c.ph, c.person) == key);
-            let cl = &vcs_ref[lo..hi];
+            let cv = &vcs_ref[(key.0 >> SH2) as usize];
+            let lo = cv.partition_point(|c| (c.ph, c.person) < key);
+            let hi = lo + cv[lo..].partition_point(|c| (c.ph, c.person) == key);
+            let cl = &cv[lo..hi];
             let (mut j, mut i, mut run) = (0usize, 0usize, 0usize);
             // day accumulator
             let mut cur_day = i32::MIN;
@@ -796,6 +829,8 @@ fn main() {
     // ---------------- write parquet ----------------
     write_outputs(&out, &ud, &cd, &cat_names, &camp_names);
     log(&t0, "done");
+    // 1BRC trick: skip destructors / allocator teardown of GBs of buffers; outputs are already written + closed.
+    std::process::exit(0);
 }
 
 fn write_outputs(
