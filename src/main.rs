@@ -1763,8 +1763,11 @@ fn main() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+    extern "C" {
+        fn _exit(status: i32) -> !;
+    }
     unsafe {
-        libc::_exit(0);
+        _exit(0);
     }
 }
 
