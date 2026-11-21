@@ -53,31 +53,52 @@ fn field(f: S) -> Result<Option<S>, ()> {
     }
 }
 
-/// Split a line into exactly out.len() fields per rules.md; false = malformed.
+#[inline(always)]
+fn fin(f: S, quotes: u32) -> Result<Option<S>, ()> {
+    if quotes == 0 {
+        Ok(if f.is_empty() { None } else { Some(f) })
+    } else {
+        let n = f.len();
+        // quotes only allowed as one pair around the whole field
+        if quotes == 2 && n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
+            Ok(if n == 2 { None } else { Some(&f[1..n - 1]) })
+        } else {
+            Err(())
+        }
+    }
+}
+
+/// Split a line into exactly out.len() fields per rules.md; false = malformed. Single pass, no per-field calls.
 #[inline]
 fn split(line: S, out: &mut [Option<S>]) -> bool {
     let n = out.len();
     let mut k = 0;
     let mut start = 0;
-    loop {
-        let end = match memchr(b',', &line[start..]) {
-            Some(p) => start + p,
-            None => line.len(),
-        };
-        if k >= n {
-            return false;
+    let mut q = 0u32;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b',' {
+            if k >= n {
+                return false;
+            }
+            match fin(&line[start..i], q) {
+                Ok(v) => out[k] = v,
+                Err(_) => return false,
+            }
+            k += 1;
+            start = i + 1;
+            q = 0;
+        } else if c == b'"' {
+            q += 1;
         }
-        match field(&line[start..end]) {
-            Ok(v) => out[k] = v,
-            Err(_) => return false,
-        }
-        k += 1;
-        if end == line.len() {
-            break;
-        }
-        start = end + 1;
     }
-    k == n
+    if k >= n {
+        return false;
+    }
+    match fin(&line[start..], q) {
+        Ok(v) => out[k] = v,
+        Err(_) => return false,
+    }
+    k + 1 == n
 }
 
 fn for_lines(d: S, skip_header: bool, mut f: impl FnMut(S)) {
@@ -254,6 +275,21 @@ struct VE {
     cat: u32, // purchase category id, u32::MAX for non-purchase
     price: i64,
 }
+
+/// v4 parsed event: dedup key + the validated record (ve.cat == INVALID when the row fails validation).
+struct Rec {
+    h: u64,
+    ingest: i64,
+    ord: u64,
+    id: S,
+    ve: VE,
+}
+const INVALID: u32 = u32::MAX - 1;
+const BAD: VE = VE { ph: 0, person: &[], ts: 0, cat: INVALID, price: 0 };
+const NB1: usize = 512;
+const SH1: u32 = 64 - 9;
+const NB2: usize = 256;
+const SH2: u32 = 64 - 8;
 
 struct Ck {
     h: u64,
@@ -443,73 +479,110 @@ fn main() {
     let (ves, vcs) = rayon::join(
         || {
             let echunks = chunks(&data.join("events"));
-            // Phase 1: keep raw field slices; parse only ingest_ts (needed for dedup).
-            let evs: Vec<Ev> = echunks
+            // v4 Phase A: parse + validate inline (sequential memory), scatter by event_id hash into NB1 buckets.
+            let validate = |user: Option<S>, ts: Option<S>, et: Option<S>, prod: Option<S>, price: Option<S>, ingest: i64| -> Option<VE> {
+                let user = user?;
+                let ts = parse_ts(ts?)?;
+                if ts < ws || ts >= we || prod.is_none() {
+                    return None;
+                }
+                let et = match et {
+                    Some(b"view") => 1,
+                    Some(b"cart") => 2,
+                    Some(b"purchase") => 3,
+                    _ => return None,
+                };
+                let price = if et == 3 { parse_price(price) } else { 0 };
+                if et == 3 && price < 1 {
+                    return None;
+                }
+                if ingest - ts > DAY {
+                    return None;
+                }
+                let person = resolve(user);
+                let cat = if et == 3 { *prod_cat.get(prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
+                Some(VE { ph: xxh3_64(person), person, ts, cat, price })
+            };
+            let parts: Vec<Vec<Vec<Rec>>> = echunks
                 .par_iter()
-                .flat_map_iter(|&(d, first)| {
-                    let mut v = Vec::with_capacity(d.len() / 80);
+                .enumerate()
+                .map(|(ci, &(d, first))| {
+                    let cap = d.len() / 70 / NB1 + 16;
+                    let mut out: Vec<Vec<Rec>> = (0..NB1).map(|_| Vec::with_capacity(cap)).collect();
                     let mut f = [None; 7];
+                    let mut ln: u64 = 0;
                     for_lines(d, first, |l| {
                         if split(l, &mut f) {
                             if let Some(id) = f[0] {
-                                v.push(Ev {
-                                    h: xxh3_64(id),
-                                    id,
-                                    user: f[1],
-                                    ts: f[2],
-                                    ingest: f[3].and_then(parse_ts).unwrap_or(i64::MAX),
-                                    et: f[4],
-                                    prod: f[5],
-                                    price: f[6],
-                                });
+                                let h = xxh3_64(id);
+                                let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
+                                let ve = validate(f[1], f[2], f[4], f[5], f[6], ingest).unwrap_or(BAD);
+                                out[(h >> SH1) as usize].push(Rec { h, ingest, ord: ((ci as u64) << 32) | ln, id, ve });
+                                ln += 1;
                             }
                         }
                     });
+                    out
+                })
+                .collect();
+            log(&t0, "events parsed");
+            // Phase B: per id-bucket dedup (first in (ingest, file order)); exact id check on hash collisions.
+            // Survivors that are valid are scattered by person hash into NB2 buckets.
+            let outs: Vec<Vec<Vec<VE>>> = (0..NB1)
+                .into_par_iter()
+                .map(|b| {
+                    let n: usize = parts.iter().map(|p| p[b].len()).sum();
+                    let mut keys: Vec<(u64, i64, u64, &Rec)> = Vec::with_capacity(n);
+                    for p in &parts {
+                        keys.extend(p[b].iter().map(|r| (r.h, r.ingest, r.ord, r)));
+                    }
+                    keys.sort_unstable_by_key(|k| (k.0, k.1, k.2));
+                    let mut out: Vec<Vec<VE>> = (0..NB2).map(|_| Vec::with_capacity(n / NB2 + 16)).collect();
+                    let mut emit = |r: &Rec| {
+                        if r.ve.cat != INVALID {
+                            out[(r.ve.ph >> SH2) as usize].push(r.ve);
+                        }
+                    };
+                    let mut s = 0;
+                    while s < keys.len() {
+                        let mut e = s + 1;
+                        while e < keys.len() && keys[e].0 == keys[s].0 {
+                            e += 1;
+                        }
+                        let g = &mut keys[s..e];
+                        if g.iter().all(|k| k.3.id == g[0].3.id) {
+                            emit(g[0].3);
+                        } else {
+                            g.sort_by(|x, y| x.3.id.cmp(y.3.id).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+                            emit(g[0].3);
+                            for w in 1..g.len() {
+                                if g[w].3.id != g[w - 1].3.id {
+                                    emit(g[w].3);
+                                }
+                            }
+                        }
+                        s = e;
+                    }
+                    out
+                })
+                .collect();
+            drop(parts);
+            // Phase C: per person-bucket concat + local sort by (ph, person, ts). Bucket order == global (ph) order.
+            let pb: Vec<Vec<VE>> = (0..NB2)
+                .into_par_iter()
+                .map(|p| {
+                    let n: usize = outs.iter().map(|o| o[p].len()).sum();
+                    let mut v: Vec<VE> = Vec::with_capacity(n);
+                    for o in &outs {
+                        v.extend_from_slice(&o[p]);
+                    }
+                    v.sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)));
                     v
                 })
                 .collect();
-            log(&t0, &format!("events parsed: {}", evs.len()));
-            // Phase 2: dedup on compact keys (hash, ingest, row); exact id check inside equal-hash groups.
-            let mut keys: Vec<(u64, i64, u32)> =
-                evs.par_iter().enumerate().map(|(i, e)| (e.h, e.ingest, i as u32)).collect();
-            keys.par_sort_unstable();
-            let kept = dedup_keys(
-                &keys,
-                |a, b| evs[a].id == evs[b].id,
-                |a, b| evs[a].id.cmp(evs[b].id).then(evs[a].ingest.cmp(&evs[b].ingest)).then(a.cmp(&b)),
-            );
-            // Phase 3: validate kept copies only.
-            let mut ves: Vec<VE> = kept
-                .par_iter()
-                .filter_map(|&ix| {
-                    let e = &evs[ix as usize];
-                    let user = e.user?;
-                    let ts = parse_ts(e.ts?)?;
-                    if ts < ws || ts >= we || e.prod.is_none() {
-                        return None;
-                    }
-                    let et = match e.et {
-                        Some(b"view") => 1,
-                        Some(b"cart") => 2,
-                        Some(b"purchase") => 3,
-                        _ => return None,
-                    };
-                    let price = if et == 3 { parse_price(e.price) } else { 0 };
-                    if et == 3 && price < 1 {
-                        return None;
-                    }
-                    if e.ingest - ts > DAY {
-                        return None;
-                    }
-                    let person = resolve(user);
-                    let cat = if et == 3 { *prod_cat.get(e.prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
-                    Some(VE { ph: xxh3_64(person), person, ts, cat, price })
-                })
-                .collect();
-            drop(evs);
-            log(&t0, &format!("events valid: {}", ves.len()));
-            ves.par_sort_unstable_by(|a, b| a.ph.cmp(&b.ph).then_with(|| a.person.cmp(b.person)).then(a.ts.cmp(&b.ts)));
-            ves
+            drop(outs);
+            log(&t0, &format!("events valid: {}", pb.iter().map(|v| v.len()).sum::<usize>()));
+            pb
         },
         || {
             let cchunks = chunks(&data.join("clicks"));
@@ -555,16 +628,20 @@ fn main() {
     );
 
     // ---------------- per person ----------------
-    let nv = ves.len();
-    let mut starts: Vec<usize> = (1..nv)
-        .into_par_iter()
-        .filter(|&i| ves[i].ph != ves[i - 1].ph || ves[i].person != ves[i - 1].person)
+    let groups: Vec<&[VE]> = ves
+        .par_iter()
+        .flat_map_iter(|v| {
+            let mut g = Vec::new();
+            let mut s0 = 0;
+            for i in 1..=v.len() {
+                if i == v.len() || v[i].ph != v[i - 1].ph || v[i].person != v[i - 1].person {
+                    g.push(&v[s0..i]);
+                    s0 = i;
+                }
+            }
+            g
+        })
         .collect();
-    if nv > 0 {
-        starts.insert(0, 0);
-    }
-    let groups: Vec<(usize, usize)> =
-        (0..starts.len()).map(|k| (starts[k], if k + 1 < starts.len() { starts[k + 1] } else { nv })).collect();
 
     struct Acc {
         ud: Vec<(S, i32, i64, i64, i64, u32)>,
@@ -582,13 +659,12 @@ fn main() {
         pos: vec![u32::MAX; ncamp],
         cats: Vec::new(),
     };
-    let ves_ref = &ves;
     let vcs_ref = &vcs;
     let cat_rank_ref = &cat_rank;
     let result = groups
         .par_iter()
-        .fold(new_acc, |mut acc, &(s, e)| {
-            let ev = &ves_ref[s..e];
+        .fold(new_acc, |mut acc, ev: &&[VE]| {
+            let ev: &[VE] = ev;
             let key = (ev[0].ph, ev[0].person);
             let lo = vcs_ref.partition_point(|c| (c.ph, c.person) < key);
             let hi = lo + vcs_ref[lo..].partition_point(|c| (c.ph, c.person) == key);
