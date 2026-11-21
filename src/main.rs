@@ -1,4 +1,5 @@
 //! Shopping Sessions engine (Rust). Implements rules.md exactly; v1 DuckDB pipeline (git history) is the reference.
+#![allow(dead_code)]
 use memchr::{memchr, memchr_iter};
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -39,18 +40,24 @@ fn log(t0: &Instant, m: &str) {
 }
 
 // ---------------- CSV dialect ----------------
-#[inline]
-fn field(f: S) -> Result<Option<S>, ()> {
-    if memchr(b'"', f).is_some() {
+#[inline(always)]
+fn clean_field(f: S) -> Result<Option<S>, ()> {
+    if f.is_empty() {
+        return Ok(None);
+    }
+    if f[0] == b'"' || f[f.len() - 1] == b'"' {
         let n = f.len();
         if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' && memchr(b'"', &f[1..n - 1]).is_none() {
-            let v = &f[1..n - 1];
-            Ok(if v.is_empty() { None } else { Some(v) })
+            Ok(if n == 2 { None } else { Some(&f[1..n - 1]) })
         } else {
             Err(())
         }
     } else {
-        Ok(if f.is_empty() { None } else { Some(f) })
+        if memchr(b'"', f).is_some() {
+            Err(())
+        } else {
+            Ok(Some(f))
+        }
     }
 }
 
@@ -142,9 +149,34 @@ fn populate_out_const<const NF: usize>(
     }
 }
 
-/// AVX-512 structural scan: 64-byte blocks, masks for \n, ',', '"'.
+#[inline(always)]
+fn populate_out_quoted<const NF: usize>(
+    data: S,
+    line_start: usize,
+    commas: &[u32; 16],
+    line_end: usize,
+    out: &mut [Option<S>],
+) -> bool {
+    let mut prev = line_start;
+    for k in 0..NF - 1 {
+        let cp = commas[k] as usize;
+        match clean_field(&data[prev..cp]) {
+            Ok(v) => out[k] = v,
+            Err(_) => return false,
+        }
+        prev = cp + 1;
+    }
+    match clean_field(&data[prev..line_end]) {
+        Ok(v) => out[NF - 1] = v,
+        Err(_) => return false,
+    }
+    true
+}
+
+/// AVX-512 structural scan: 64-byte blocks, unconditional comma scanning (_mm512_cmpeq_epi8_mask).
+/// Exploits the invariant that commas never appear inside quoted fields.
 /// Lines without quotes populate `out` directly from comma mask positions.
-/// Lines with quotes take the exact slow path `split_scalar`.
+/// Lines with quotes strip quotes per field via `populate_out_quoted` without scalar loop fallback.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 unsafe fn simd_for_lines<const NF: usize>(
@@ -181,7 +213,7 @@ unsafe fn simd_for_lines<const NF: usize>(
             if qt_mask != 0 {
                 has_quotes = true;
             }
-            if !skipping && !has_quotes {
+            if !skipping {
                 let mut m = cm_mask;
                 while m != 0 {
                     let bit = m.trailing_zeros();
@@ -215,22 +247,22 @@ unsafe fn simd_for_lines<const NF: usize>(
             if skipping {
                 skipping = false;
             } else {
+                let mut m = seg_cm;
+                while m != 0 {
+                    let bit = m.trailing_zeros();
+                    if ncommas < 16 {
+                        commas[ncommas] = (pos + bit as usize) as u32;
+                    }
+                    ncommas += 1;
+                    m &= m - 1;
+                }
                 let line = &data[line_start..nl_pos];
-                if has_quotes {
-                    if split_scalar(line, out) {
-                        handler(line, out, true);
-                    }
-                } else {
-                    let mut m = seg_cm;
-                    while m != 0 {
-                        let bit = m.trailing_zeros();
-                        if ncommas < 16 {
-                            commas[ncommas] = (pos + bit as usize) as u32;
+                if ncommas + 1 == NF {
+                    if has_quotes {
+                        if populate_out_quoted::<NF>(data, line_start, &commas, nl_pos, out) {
+                            handler(line, out, true);
                         }
-                        ncommas += 1;
-                        m &= m - 1;
-                    }
-                    if ncommas + 1 == NF {
+                    } else {
                         populate_out_const::<NF>(data, line_start, &commas, nl_pos, out);
                         handler(line, out, false);
                     }
@@ -250,7 +282,7 @@ unsafe fn simd_for_lines<const NF: usize>(
         if cur_qt != 0 {
             has_quotes = true;
         }
-        if !skipping && !has_quotes {
+        if !skipping {
             let mut m = cur_cm;
             while m != 0 {
                 let bit = m.trailing_zeros();
@@ -273,13 +305,15 @@ unsafe fn simd_for_lines<const NF: usize>(
                 skipping = false;
             } else {
                 let line = &data[line_start..pos];
-                if has_quotes {
-                    if split_scalar(line, out) {
-                        handler(line, out, true);
+                if ncommas + 1 == NF {
+                    if has_quotes {
+                        if populate_out_quoted::<NF>(data, line_start, &commas, pos, out) {
+                            handler(line, out, true);
+                        }
+                    } else {
+                        populate_out_const::<NF>(data, line_start, &commas, pos, out);
+                        handler(line, out, false);
                     }
-                } else if ncommas + 1 == NF {
-                    populate_out_const::<NF>(data, line_start, &commas, pos, out);
-                    handler(line, out, false);
                 }
             }
             line_start = pos + 1;
@@ -287,7 +321,7 @@ unsafe fn simd_for_lines<const NF: usize>(
             ncommas = 0;
         } else if c == b'"' {
             has_quotes = true;
-        } else if c == b',' && !skipping && !has_quotes {
+        } else if c == b',' && !skipping {
             if ncommas < 16 {
                 commas[ncommas] = pos as u32;
             }
@@ -298,13 +332,15 @@ unsafe fn simd_for_lines<const NF: usize>(
 
     if line_start < len && !skipping {
         let line = &data[line_start..];
-        if has_quotes {
-            if split_scalar(line, out) {
-                handler(line, out, true);
+        if ncommas + 1 == NF {
+            if has_quotes {
+                if populate_out_quoted::<NF>(data, line_start, &commas, len, out) {
+                    handler(line, out, true);
+                }
+            } else {
+                populate_out_const::<NF>(data, line_start, &commas, len, out);
+                handler(line, out, false);
             }
-        } else if ncommas + 1 == NF {
-            populate_out_const::<NF>(data, line_start, &commas, len, out);
-            handler(line, out, false);
         }
     }
 }
@@ -321,16 +357,17 @@ fn for_lines_split<const NF: usize>(
         #[cfg(target_feature = "avx512f")]
         {
             unsafe { simd_for_lines::<NF>(d, skip_header, out, handler); }
-            return;
         }
         #[cfg(not(target_feature = "avx512f"))]
         {
             if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
                 unsafe { simd_for_lines::<NF>(d, skip_header, out, handler); }
-                return;
+            } else {
+                for_lines_split_scalar(d, skip_header, NF, out, handler);
             }
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
     for_lines_split_scalar(d, skip_header, NF, out, handler);
 }
 
@@ -429,14 +466,45 @@ fn map_file(p: &Path) -> S {
 }
 
 // ---------------- timestamps ----------------
-#[inline]
-fn d2(s: &[u8], i: usize) -> Option<i64> {
-    let (a, b) = (s[i], s[i + 1]);
-    if a.is_ascii_digit() && b.is_ascii_digit() {
-        Some(((a - b'0') as i64) * 10 + (b - b'0') as i64)
-    } else {
-        None
+#[inline(always)]
+fn parse_2_digits_swar(val: u16) -> Option<u32> {
+    let sub = val.wrapping_sub(0x3030);
+    let high = val.wrapping_add(0x4646) & 0x8080;
+    if ((sub | high) & 0x8080) != 0 {
+        return None;
     }
+    let d0 = (sub & 0xFF) as u32;
+    let d1 = (sub >> 8) as u32;
+    Some(d0 * 10 + d1)
+}
+
+#[inline(always)]
+fn parse_4_digits_swar(val: u32) -> Option<u32> {
+    let sub = val.wrapping_sub(0x3030_3030);
+    let high = val.wrapping_add(0x4646_4646) & 0x8080_8080;
+    if ((sub | high) & 0x8080_8080) != 0 {
+        return None;
+    }
+    let step1 = (sub * 10) + (sub >> 8);
+    let step1_masked = step1 & 0x00FF_00FF;
+    let step2 = (step1_masked * 100) + (step1_masked >> 16);
+    Some(step2 & 0xFFFF)
+}
+
+#[inline(always)]
+fn parse_8_digits_swar(val: u64) -> Option<u64> {
+    let sub = val.wrapping_sub(0x3030_3030_3030_3030);
+    let high = val.wrapping_add(0x4646_4646_4646_4646) & 0x8080_8080_8080_8080;
+    if ((sub | high) & 0x8080_8080_8080_8080) != 0 {
+        return None;
+    }
+    let step1 = (sub * 10) + (sub >> 8);
+    let step1_masked = step1 & 0x00FF_00FF_00FF_00FF;
+
+    let step2 = (step1_masked * 100) + (step1_masked >> 16);
+    let step2_masked = step2 & 0x0000_FFFF_0000_FFFF;
+
+    Some(((step2_masked * 10_000) + (step2_masked >> 32)) & 0xFFFF_FFFF)
 }
 
 const DB_Y0: i64 = 1900;
@@ -477,15 +545,13 @@ fn parse_ts(s: S) -> Option<i64> {
         if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
             return None;
         }
-        // all 14 date/time digits checked in one branch-free pass
-        let dg = |i: usize| s[i].wrapping_sub(b'0');
-        let ds = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9), dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
-        if ds.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
-            return None;
-        }
-        let v = |k: usize| ds[k] as i64;
-        let y = v(0) * 1000 + v(1) * 100 + v(2) * 10 + v(3);
-        let (mo, d, h, mi, se) = (v(4) * 10 + v(5), v(6) * 10 + v(7), v(8) * 10 + v(9), v(10) * 10 + v(11), v(12) * 10 + v(13));
+        let y = parse_4_digits_swar(u32::from_le_bytes(s[0..4].try_into().unwrap()))? as i64;
+        let mo = parse_2_digits_swar(u16::from_le_bytes(s[5..7].try_into().unwrap()))? as i64;
+        let d = parse_2_digits_swar(u16::from_le_bytes(s[8..10].try_into().unwrap()))? as i64;
+        let h = parse_2_digits_swar(u16::from_le_bytes(s[11..13].try_into().unwrap()))? as i64;
+        let mi = parse_2_digits_swar(u16::from_le_bytes(s[14..16].try_into().unwrap()))? as i64;
+        let se = parse_2_digits_swar(u16::from_le_bytes(s[17..19].try_into().unwrap()))? as i64;
+
         let off = if n == 20 {
             if s[19] != b'Z' {
                 return None;
@@ -500,7 +566,8 @@ fn parse_ts(s: S) -> Option<i64> {
             if s[22] != b':' {
                 return None;
             }
-            let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
+            let oh = parse_2_digits_swar(u16::from_le_bytes(s[20..22].try_into().unwrap()))? as i64;
+            let om = parse_2_digits_swar(u16::from_le_bytes(s[23..25].try_into().unwrap()))? as i64;
             if oh > 23 || om > 59 {
                 return None;
             }
@@ -523,8 +590,20 @@ fn parse_ts(s: S) -> Option<i64> {
         };
         Some(days * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
     } else {
-        // F3: digits only; leading zeros allowed (strip them first, then <= 19 significant digits)
-        if n == 0 || s.iter().any(|c| !c.is_ascii_digit()) {
+        // Fast path for standard 13-digit F3 epoch ms
+        if n == 13 && s[0] != b'0' {
+            let v8 = u64::from_le_bytes(s[0..8].try_into().unwrap());
+            let v4 = u32::from_le_bytes(s[8..12].try_into().unwrap());
+            if let (Some(hi), Some(lo4)) = (parse_8_digits_swar(v8), parse_4_digits_swar(v4)) {
+                let last = s[12].wrapping_sub(b'0');
+                if last <= 9 {
+                    let val = hi * 100_000 + (lo4 as u64) * 10 + last as u64;
+                    return Some(val as i64);
+                }
+            }
+        }
+        // General F3: digits only; leading zeros allowed (strip them first, then <= 19 significant digits)
+        if n == 0 {
             return None;
         }
         let mut i = 0;
@@ -532,12 +611,30 @@ fn parse_ts(s: S) -> Option<i64> {
             i += 1;
         }
         let t = &s[i..];
+        if t.is_empty() {
+            return Some(0);
+        }
         if t.len() > 19 {
             return None;
         }
+        if t.len() == 13 {
+            let v8 = u64::from_le_bytes(t[0..8].try_into().unwrap());
+            let v4 = u32::from_le_bytes(t[8..12].try_into().unwrap());
+            if let (Some(hi), Some(lo4)) = (parse_8_digits_swar(v8), parse_4_digits_swar(v4)) {
+                let last = t[12].wrapping_sub(b'0');
+                if last <= 9 {
+                    let val = hi * 100_000 + (lo4 as u64) * 10 + last as u64;
+                    return Some(val as i64);
+                }
+            }
+        }
         let mut v: u64 = 0;
         for &c in t {
-            v = v * 10 + (c - b'0') as u64;
+            let d = c.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as u64;
         }
         if v > i64::MAX as u64 { None } else { Some(v as i64) }
     }
@@ -566,21 +663,9 @@ struct EvKey {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
 struct EventPayload {
     id: S,
-    user: S,
-    lo: u64,
-    hi: u64,
-    ts_rel: u64,
-    cat_price: u64,
-}
-
-impl EventPayload {
-    #[inline(always)]
-    fn is_valid(&self) -> bool {
-        (self.cat_price >> 32) as u32 != INVALID
-    }
+    rec: EvRec,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -589,9 +674,12 @@ struct EvRec {
     cat_price: u64,
 }
 
-struct RawPtr<T>(*mut T);
-unsafe impl<T> Send for RawPtr<T> {}
-unsafe impl<T> Sync for RawPtr<T> {}
+impl EvRec {
+    #[inline(always)]
+    fn is_valid(&self) -> bool {
+        (self.cat_price >> 32) as u32 != INVALID
+    }
+}
 
 #[derive(Clone, Copy)]
 struct CkRec {
@@ -870,20 +958,71 @@ fn utf8(s: &[u8]) -> std::borrow::Cow<'_, str> {
     String::from_utf8_lossy(s)
 }
 
-fn build_links(dir: &Path, t0: &Instant) -> (PTab, Vec<S>, u32) {
-    let lchunks = chunks(dir);
-    let mut pairs: Vec<(S, S)> = Vec::with_capacity(1_000_000);
-    let mut f = [None; 2];
-    for &(d, first) in &lchunks {
-        for_lines(d, first, |l| {
-            if split(l, &mut f) {
-                if let (Some(a), Some(b)) = (f[0], f[1]) {
-                    pairs.push((a, b));
-                }
-            }
+fn main() {
+    let t0 = Instant::now();
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
+    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
+    let ncpu: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    rayon::ThreadPoolBuilder::new().num_threads(ncpu.max(1)).build_global().ok();
+
+    let man = fs::read_to_string(data.join("manifest.json")).expect("manifest");
+    let ws = parse_ts(Box::leak(manifest_field(&man, "window_start").into_bytes().into_boxed_slice())).unwrap();
+    let we = parse_ts(Box::leak(manifest_field(&man, "window_end").into_bytes().into_boxed_slice())).unwrap();
+
+    let ws_day = ws.div_euclid(DAY) as i32;
+    let we_day = (we - 1).div_euclid(DAY) as i32;
+    let ndays = (we_day - ws_day + 1).max(1) as usize;
+    // small tables
+    let prods = parse_two(&data.join("products.csv"));
+    let camps = parse_two(&data.join("campaigns.csv"));
+    let mut cat_names: Vec<S> = Vec::new();
+    let mut cat_id: Map<S, u32> = Map::default();
+    let mut prod_cat: Map<S, u32> = Map::default();
+    for &(p, c) in &prods {
+        let id = *cat_id.entry(c).or_insert_with(|| {
+            cat_names.push(c);
+            (cat_names.len() - 1) as u32
+        });
+        prod_cat.insert(p, id);
+    }
+    let unknown: u32 = *cat_id.entry(b"unknown").or_insert_with(|| {
+        cat_names.push(b"unknown");
+        (cat_names.len() - 1) as u32
+    });
+    // rank of each category in byte order (for top_category ties)
+    let mut order: Vec<u32> = (0..cat_names.len() as u32).collect();
+    order.sort_by(|&a, &b| cat_names[a as usize].cmp(cat_names[b as usize]));
+    let mut cat_rank = vec![0u32; cat_names.len()];
+    for (r, &c) in order.iter().enumerate() {
+        cat_rank[c as usize] = r as u32;
+    }
+    let mut camp_id: Map<S, u32> = Map::default();
+    let mut camp_names: Vec<(S, S)> = Vec::new();
+    for &(c, ch) in &camps {
+        camp_id.entry(c).or_insert_with(|| {
+            camp_names.push((c, ch));
+            (camp_names.len() - 1) as u32
         });
     }
-    log(t0, &format!("links: parsed {} pairs in", pairs.len()));
+    let ncamp = camp_names.len();
+
+    // links -> union-find; root = byte-wise smallest id
+    let lchunks = chunks(&data.join("links"));
+    let pairs: Vec<(S, S)> = lchunks
+        .par_iter()
+        .flat_map_iter(|&(d, first)| {
+            let mut v = Vec::new();
+            let mut f = [None; 2];
+            for_lines_split::<2>(d, first, &mut f, |_l, f, _q| {
+                if let (Some(a), Some(b)) = (f[0], f[1]) {
+                    if !a.is_empty() && !b.is_empty() {
+                        v.push((a, b));
+                    }
+                }
+            });
+            v
+        })
+        .collect();
     let mut idx: Map<S, u32> = Map::default();
     let mut names: Vec<S> = Vec::new();
     let mut parent: Vec<u32> = Vec::new();
@@ -940,492 +1079,8 @@ fn build_links(dir: &Path, t0: &Instant) -> (PTab, Vec<S>, u32) {
         let pid = root_pid[r as usize];
         ptab.insert(names[i as usize], pid);
     }
-    log(t0, &format!("links: {} pairs, {} ids, {} roots", pairs.len(), names.len(), num_roots));
-    (ptab, root_names, num_roots)
-}
-
-fn parse_clicks(
-    cchunks: &[(S, bool)],
-    ptab: &PTab,
-    interner: &Interner,
-    ws: i64,
-    we: i64,
-    base_ms: i64,
-    camp_id: &Map<S, u32>,
-    t0: &Instant,
-) -> Vec<Vec<CkRec>> {
-    const CLICK_BATCH: usize = 32;
-
-    #[derive(Clone, Copy)]
-    struct ClickBatchItem {
-        id: S,
-        user: S,
-        user_h: u64,
-        lo: u64,
-        hi: u64,
-        camp: u32,
-        ts: i64,
-        valid: bool,
-    }
-
-    const DUMMY_CLICK: ClickBatchItem = ClickBatchItem {
-        id: &[],
-        user: &[],
-        user_h: 0,
-        lo: 0,
-        hi: 0,
-        camp: 0,
-        ts: 0,
-        valid: false,
-    };
-
-    let (survivors, counts): (Vec<Vec<CkRec>>, Vec<[u32; NB2]>) = cchunks
-        .par_iter()
-        .map(|&(d, first)| {
-            let mut surv: Vec<CkRec> = Vec::with_capacity(d.len() / 50 + 16);
-            let mut cnt = [0u32; NB2];
-            let mut f = [None; 4];
-            let mut batch = [DUMMY_CLICK; CLICK_BATCH];
-            let mut batch_len = 0;
-
-            let mut flush_clicks = |batch: &[ClickBatchItem; CLICK_BATCH], len: usize, cnt: &mut [u32; NB2], surv: &mut Vec<CkRec>| {
-                if len == 0 { return; }
-                for item in &batch[..len] {
-                    if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
-                        let slot_ptab = (item.user_h as usize) & ptab.mask;
-                        let slot_intern = (item.user_h as usize) & interner.mask;
-                        unsafe {
-                            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                            let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
-                            _mm_prefetch(p1, _MM_HINT_T0);
-                            let p2 = interner.slots.as_ptr().add(slot_intern) as *const i8;
-                            _mm_prefetch(p2, _MM_HINT_T0);
-                        }
-                    }
-                }
-
-                for item in &batch[..len] {
-                    if item.valid {
-                        let pid = resolve_precomputed(ptab, interner, item.user, item.user_h, item.lo, item.hi);
-                        let ts_rel = (item.ts - base_ms) as u64;
-                        let key = ((pid as u64) << 40) | ts_rel;
-                        let p = (pid & 255) as usize;
-                        cnt[p] += 1;
-                        surv.push(CkRec { key, camp: item.camp, id: item.id });
-                    }
-                }
-            };
-
-            for_lines_split::<4>(d, first, &mut f, |_l, f, _q| {
-                if let Some(id) = f[0] {
-                    if id.is_empty() { return; }
-                    let mut valid = false;
-                    let mut user: S = &[];
-                    let mut user_h = 0u64;
-                    let mut lo = 0u64;
-                    let mut hi = 0u64;
-                    let mut camp = 0u32;
-                    let mut ts = 0i64;
-
-                    if let (Some(u), Some(c), Some(t_str)) = (f[1], f[2], f[3]) {
-                        if !u.is_empty() {
-                            if let Some(t) = parse_ts(t_str) {
-                                if t >= ws - WEEK && t < we {
-                                    if let Some(&cmp) = camp_id.get(c) {
-                                        user = u;
-                                        let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
-                                        lo = l;
-                                        hi = h_val;
-                                        user_h = hash16(lo, hi);
-                                        camp = cmp;
-                                        ts = t;
-                                        valid = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    batch[batch_len] = ClickBatchItem {
-                        id,
-                        user,
-                        user_h,
-                        lo,
-                        hi,
-                        camp,
-                        ts,
-                        valid,
-                    };
-                    batch_len += 1;
-                    if batch_len == CLICK_BATCH {
-                        flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
-                        batch_len = 0;
-                    }
-                }
-            });
-            if batch_len > 0 {
-                flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
-            }
-            (surv, cnt)
-        })
-        .unzip();
-
-    let mut offsets: Vec<[usize; NB2]> = vec![[0; NB2]; cchunks.len()];
-    let mut totals = [0usize; NB2];
-    for p in 0..NB2 {
-        let mut sum = 0usize;
-        for b in 0..cchunks.len() {
-            offsets[b][p] = sum;
-            sum += counts[b][p] as usize;
-        }
-        totals[p] = sum;
-    }
-
-    let mut cb: Vec<Vec<CkRec>> = totals
-        .iter()
-        .map(|&tot| {
-            let mut v = Vec::with_capacity(tot);
-            unsafe { v.set_len(tot); }
-            v
-        })
-        .collect();
-
-    {
-        let ptrs: Vec<RawPtr<CkRec>> = cb.iter_mut().map(|v| RawPtr(v.as_mut_ptr())).collect();
-        (0..cchunks.len()).into_par_iter().for_each(|b| {
-            let mut cur_offsets = offsets[b];
-            for rec in &survivors[b] {
-                let pid = (rec.key >> 40) as usize;
-                let p = pid & 255;
-                let pos = cur_offsets[p];
-                cur_offsets[p] += 1;
-                unsafe {
-                    *ptrs[p].0.add(pos) = *rec;
-                }
-            }
-        });
-    }
-    drop(survivors);
-
-    cb.par_iter_mut().for_each(|v| {
-        v.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| a.id.cmp(b.id)));
-        v.dedup_by(|a, b| a.key == b.key && eqs(a.id, b.id));
-    });
-    log(t0, &format!("clicks valid: {}", cb.iter().map(|v| v.len()).sum::<usize>()));
-    cb
-}
-
-const VIEW: u32 = u32::from_ne_bytes(*b"view");
-const CART: u32 = u32::from_ne_bytes(*b"cart");
-const PURCHASE: u64 = u64::from_ne_bytes(*b"purchase");
-
-#[inline(always)]
-fn parse_event_type(e: S) -> u32 {
-    let n = e.len();
-    if n == 4 {
-        let w = u32::from_ne_bytes(e[..4].try_into().unwrap());
-        if w == VIEW { 1 } else if w == CART { 2 } else { 0 }
-    } else if n == 8 {
-        let w = u64::from_ne_bytes(e[..8].try_into().unwrap());
-        if w == PURCHASE { 3 } else { 0 }
-    } else {
-        0
-    }
-}
-
-fn parse_events(
-    echunks: &[(S, bool)],
-    ws: i64,
-    we: i64,
-    base_ms: i64,
-    prod_cat: &Map<S, u32>,
-    unknown: u32,
-    t0: &Instant,
-) -> (Vec<Vec<EventPayload>>, Vec<Vec<Vec<EvKey>>>) {
-    let (payloads, keys_per_chunk): (Vec<Vec<EventPayload>>, Vec<Vec<Vec<EvKey>>>) = echunks
-        .par_iter()
-        .enumerate()
-        .map(|(ci, &(d, first))| {
-            let mut payload: Vec<EventPayload> = Vec::with_capacity(d.len() / 70 + 16);
-            let cap = d.len() / 70 / NB1 + 16;
-            let mut out: Vec<Vec<EvKey>> = (0..NB1).map(|_| Vec::with_capacity(cap)).collect();
-            let mut f = [None; 7];
-
-            for_lines_split::<7>(d, first, &mut f, |_l, f, _q| {
-                if let Some(id) = f[0] {
-                    if id.is_empty() { return; }
-                    let h = xxh3_64(id);
-                    let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
-
-                    let mut user: S = &[];
-                    let mut lo = 0u64;
-                    let mut hi = 0u64;
-                    let mut ts_rel = 0u64;
-                    let mut cat_price = (INVALID as u64) << 32;
-
-                    if let (Some(u), Some(t_str), Some(e_str), Some(prod)) = (f[1], f[2], f[4], f[5]) {
-                        if !u.is_empty() && !prod.is_empty() {
-                            if let Some(t) = parse_ts(t_str) {
-                                if t >= ws && t < we && ingest - t <= DAY {
-                                    let et = parse_event_type(e_str);
-                                    if et != 0 {
-                                        let pr = if et == 3 { parse_price(f[6]) } else { 0 };
-                                        if et != 3 || pr >= 1 {
-                                            user = u;
-                                            let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
-                                            lo = l;
-                                            hi = h_val;
-                                            ts_rel = (t - base_ms) as u64;
-                                            let cat = if et == 3 { *prod_cat.get(prod).unwrap_or(&unknown) } else { u32::MAX };
-                                            cat_price = ((cat as u64) << 32) | (pr as u32 as u64);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let row = payload.len() as u32;
-                    payload.push(EventPayload { id, user, lo, hi, ts_rel, cat_price });
-                    let loc = ((ci as u64) << 32) | (row as u64);
-                    out[(h >> SH1) as usize].push(EvKey { h, ingest, loc });
-                }
-            });
-            (payload, out)
-        })
-        .unzip();
-    log(t0, "events parsed");
-    (payloads, keys_per_chunk)
-}
-
-fn dedup_and_resolve_events(
-    payloads: &[Vec<EventPayload>],
-    keys_per_chunk: &[Vec<Vec<EvKey>>],
-    ptab: &PTab,
-    interner: &Interner,
-    t0: &Instant,
-) -> Vec<Vec<EvRec>> {
-    const SURV_BATCH: usize = 32;
-    static DUMMY_PAYLOAD: EventPayload = EventPayload {
-        id: &[],
-        user: &[],
-        lo: 0,
-        hi: 0,
-        ts_rel: 0,
-        cat_price: (INVALID as u64) << 32,
-    };
-
-    let (survivors, counts): (Vec<Vec<EvRec>>, Vec<[u32; NB2]>) = (0..NB1)
-        .into_par_iter()
-        .map(|b| {
-            let n: usize = keys_per_chunk.iter().map(|k| k[b].len()).sum();
-            let mut keys: Vec<EvKey> = Vec::with_capacity(n);
-            for k in keys_per_chunk {
-                keys.extend_from_slice(&k[b]);
-            }
-            keys.sort_unstable_by_key(|k| (k.h, k.ingest, k.loc));
-            let mut surv = Vec::with_capacity(n);
-            let mut cnt = [0u32; NB2];
-
-            let mut batch: [&EventPayload; SURV_BATCH] = [&DUMMY_PAYLOAD; SURV_BATCH];
-            let mut batch_len = 0;
-
-            let mut flush_survivors = |batch: &[&EventPayload; SURV_BATCH], len: usize, surv: &mut Vec<EvRec>, cnt: &mut [u32; NB2]| {
-                if len == 0 { return; }
-                for &p in &batch[..len] {
-                    if p.user.len() <= 16 && !p.user.is_empty() {
-                        let user_h = hash16(p.lo, p.hi);
-                        let slot_ptab = (user_h as usize) & ptab.mask;
-                        let slot_intern = (user_h as usize) & interner.mask;
-                        unsafe {
-                            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                            let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
-                            _mm_prefetch(p1, _MM_HINT_T0);
-                            let p2 = interner.slots.as_ptr().add(slot_intern) as *const i8;
-                            _mm_prefetch(p2, _MM_HINT_T0);
-                        }
-                    }
-                }
-
-                for &p in &batch[..len] {
-                    let user_h = hash16(p.lo, p.hi);
-                    let pid = resolve_precomputed(ptab, interner, p.user, user_h, p.lo, p.hi);
-                    let key = ((pid as u64) << 40) | p.ts_rel;
-                    let pb_idx = (pid & 255) as usize;
-                    cnt[pb_idx] += 1;
-                    surv.push(EvRec { key, cat_price: p.cat_price });
-                }
-            };
-
-            let mut s = 0;
-            while s < keys.len() {
-                let mut e = s + 1;
-                while e < keys.len() && keys[e].h == keys[s].h {
-                    e += 1;
-                }
-                let g = &mut keys[s..e];
-                if g.len() == 1 {
-                    let ci = (g[0].loc >> 32) as usize;
-                    let row = (g[0].loc as u32) as usize;
-                    let p = &payloads[ci][row];
-                    if p.is_valid() {
-                        batch[batch_len] = p;
-                        batch_len += 1;
-                        if batch_len == SURV_BATCH {
-                            flush_survivors(&batch, batch_len, &mut surv, &mut cnt);
-                            batch_len = 0;
-                        }
-                    }
-                } else {
-                    let ci0 = (g[0].loc >> 32) as usize;
-                    let row0 = (g[0].loc as u32) as usize;
-                    let id0 = payloads[ci0][row0].id;
-                    let all_same = g[1..].iter().all(|k| {
-                        let ci = (k.loc >> 32) as usize;
-                        let row = (k.loc as u32) as usize;
-                        eqs(payloads[ci][row].id, id0)
-                    });
-                    if all_same {
-                        let p0 = &payloads[ci0][row0];
-                        if p0.is_valid() {
-                            batch[batch_len] = p0;
-                            batch_len += 1;
-                            if batch_len == SURV_BATCH {
-                                flush_survivors(&batch, batch_len, &mut surv, &mut cnt);
-                                batch_len = 0;
-                            }
-                        }
-                    } else {
-                        g.sort_by(|x, y| {
-                            let px = &payloads[(x.loc >> 32) as usize][(x.loc as u32) as usize];
-                            let py = &payloads[(y.loc >> 32) as usize][(y.loc as u32) as usize];
-                            px.id.cmp(py.id).then(x.ingest.cmp(&y.ingest)).then(x.loc.cmp(&y.loc))
-                        });
-                        let p0 = &payloads[(g[0].loc >> 32) as usize][(g[0].loc as u32) as usize];
-                        if p0.is_valid() {
-                            batch[batch_len] = p0;
-                            batch_len += 1;
-                            if batch_len == SURV_BATCH {
-                                flush_survivors(&batch, batch_len, &mut surv, &mut cnt);
-                                batch_len = 0;
-                            }
-                        }
-                        for w in 1..g.len() {
-                            let prev = &payloads[(g[w - 1].loc >> 32) as usize][(g[w - 1].loc as u32) as usize];
-                            let curr = &payloads[(g[w].loc >> 32) as usize][(g[w].loc as u32) as usize];
-                            if !eqs(curr.id, prev.id) {
-                                if curr.is_valid() {
-                                    batch[batch_len] = curr;
-                                    batch_len += 1;
-                                    if batch_len == SURV_BATCH {
-                                        flush_survivors(&batch, batch_len, &mut surv, &mut cnt);
-                                        batch_len = 0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                s = e;
-            }
-            if batch_len > 0 {
-                flush_survivors(&batch, batch_len, &mut surv, &mut cnt);
-            }
-            (surv, cnt)
-        })
-        .unzip();
-
-    let mut offsets: Vec<[usize; NB2]> = vec![[0; NB2]; NB1];
-    let mut totals = [0usize; NB2];
-    for p in 0..NB2 {
-        let mut sum = 0usize;
-        for b in 0..NB1 {
-            offsets[b][p] = sum;
-            sum += counts[b][p] as usize;
-        }
-        totals[p] = sum;
-    }
-
-    let mut pb: Vec<Vec<EvRec>> = totals
-        .iter()
-        .map(|&tot| {
-            let mut v = Vec::with_capacity(tot);
-            unsafe { v.set_len(tot); }
-            v
-        })
-        .collect();
-
-    {
-        let ptrs: Vec<RawPtr<EvRec>> = pb.iter_mut().map(|v| RawPtr(v.as_mut_ptr())).collect();
-        (0..NB1).into_par_iter().for_each(|b| {
-            let mut cur_offsets = offsets[b];
-            for rec in &survivors[b] {
-                let pid = (rec.key >> 40) as usize;
-                let p = pid & 255;
-                let pos = cur_offsets[p];
-                cur_offsets[p] += 1;
-                unsafe {
-                    *ptrs[p].0.add(pos) = *rec;
-                }
-            }
-        });
-    }
-    drop(survivors);
-
-    pb.par_iter_mut().for_each(|v| {
-        v.sort_unstable_by_key(|e| e.key);
-    });
-    log(t0, &format!("events valid: {}", pb.iter().map(|v| v.len()).sum::<usize>()));
-    pb
-}
-
-fn main() {
-    let t0 = Instant::now();
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
-    let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let ncpu: usize = std::env::var("NCPU").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-    rayon::ThreadPoolBuilder::new().num_threads(ncpu.max(1)).build_global().ok();
-
-    let man = fs::read_to_string(data.join("manifest.json")).expect("manifest");
-    let ws = parse_ts(Box::leak(manifest_field(&man, "window_start").into_bytes().into_boxed_slice())).unwrap();
-    let we = parse_ts(Box::leak(manifest_field(&man, "window_end").into_bytes().into_boxed_slice())).unwrap();
-
-    let ws_day = ws.div_euclid(DAY) as i32;
-    let we_day = (we - 1).div_euclid(DAY) as i32;
-    let ndays = (we_day - ws_day + 1).max(1) as usize;
-    // small tables
-    let prods = parse_two(&data.join("products.csv"));
-    let camps = parse_two(&data.join("campaigns.csv"));
-    let mut cat_names: Vec<S> = Vec::new();
-    let mut cat_id: Map<S, u32> = Map::default();
-    let mut prod_cat: Map<S, u32> = Map::default();
-    for &(p, c) in &prods {
-        let id = *cat_id.entry(c).or_insert_with(|| {
-            cat_names.push(c);
-            (cat_names.len() - 1) as u32
-        });
-        prod_cat.insert(p, id);
-    }
-    let unknown: u32 = *cat_id.entry(b"unknown").or_insert_with(|| {
-        cat_names.push(b"unknown");
-        (cat_names.len() - 1) as u32
-    });
-    // rank of each category in byte order (for top_category ties)
-    let mut order: Vec<u32> = (0..cat_names.len() as u32).collect();
-    order.sort_by(|&a, &b| cat_names[a as usize].cmp(cat_names[b as usize]));
-    let mut cat_rank = vec![0u32; cat_names.len()];
-    for (r, &c) in order.iter().enumerate() {
-        cat_rank[c as usize] = r as u32;
-    }
-    let mut camp_id: Map<S, u32> = Map::default();
-    let mut camp_names: Vec<(S, S)> = Vec::new();
-    for &(c, ch) in &camps {
-        camp_id.entry(c).or_insert_with(|| {
-            camp_names.push((c, ch));
-            (camp_names.len() - 1) as u32
-        });
-    }
-    let ncamp = camp_names.len();
+    log(&t0, &format!("links: {} pairs, {} ids, {} roots", pairs.len(), names.len(), num_roots));
+    let ptab = &ptab;
 
     let echunks = chunks(&data.join("events"));
     let cchunks = chunks(&data.join("clicks"));
@@ -1438,25 +1093,462 @@ fn main() {
     } else {
         8_388_608
     };
+    let interner = Interner::new(icap, num_roots);
+    let interner_ref = &interner;
+    let _root_names_ref = &root_names;
 
     let base_ms = ws - WEEK;
     assert!(we - base_ms < (1i64 << 40), "window exceeds 40 bits");
 
-    // Stage 1: links || events parsing
-    let ((ptab, root_names, num_roots), (payloads, keys_per_chunk)) = rayon::join(
-        || build_links(&data.join("links"), &t0),
-        || parse_events(&echunks, ws, we, base_ms, &prod_cat, unknown, &t0),
-    );
+    // ---------------- events || clicks (independent until the per-person pass) ----------------
+    let (ev_pb, cl_pb) = rayon::join(
+        || {
+            const EVENT_BATCH: usize = 32;
 
-    let interner = Interner::new(icap, num_roots);
+            #[derive(Clone, Copy)]
+            struct EventBatchItem {
+                id: S,
+                h: u64,
+                ingest: i64,
+                user: S,
+                user_h: u64,
+                lo: u64,
+                hi: u64,
+                ts: i64,
+                cat: u32,
+                price: i64,
+                valid: bool,
+            }
 
-    // Stage 2: clicks || events dedup + survivor resolution
-    let (cl_pb, ev_pb) = rayon::join(
-        || parse_clicks(&cchunks, &ptab, &interner, ws, we, base_ms, &camp_id, &t0),
-        || dedup_and_resolve_events(&payloads, &keys_per_chunk, &ptab, &interner, &t0),
+            const DUMMY_EVENT: EventBatchItem = EventBatchItem {
+                id: &[],
+                h: 0,
+                ingest: 0,
+                user: &[],
+                user_h: 0,
+                lo: 0,
+                hi: 0,
+                ts: 0,
+                cat: INVALID,
+                price: 0,
+                valid: false,
+            };
+
+            let (payloads, keys_per_chunk): (Vec<Vec<EventPayload>>, Vec<Vec<Vec<EvKey>>>) = echunks
+                .par_iter()
+                .enumerate()
+                .map(|(ci, &(d, first))| {
+                    let mut payload: Vec<EventPayload> = Vec::with_capacity(d.len() / 70 + 16);
+                    let cap = d.len() / 70 / NB1 + 16;
+                    let mut out: Vec<Vec<EvKey>> = (0..NB1).map(|_| Vec::with_capacity(cap)).collect();
+                    let mut f = [None; 7];
+                    let mut batch = [DUMMY_EVENT; EVENT_BATCH];
+                    let mut batch_len = 0;
+
+                    let flush_events = |batch: &[EventBatchItem; EVENT_BATCH], len: usize, payload: &mut Vec<EventPayload>, out: &mut Vec<Vec<EvKey>>| {
+                        if len == 0 { return; }
+                        for item in &batch[..len] {
+                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                                let slot_ptab = (item.user_h as usize) & ptab.mask;
+                                let slot_intern = (item.user_h as usize) & interner_ref.mask;
+                                unsafe {
+                                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                    let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
+                                    _mm_prefetch(p1, _MM_HINT_T0);
+                                    let p2 = interner_ref.slots.as_ptr().add(slot_intern) as *const i8;
+                                    _mm_prefetch(p2, _MM_HINT_T0);
+                                }
+                            }
+                        }
+
+                        for item in &batch[..len] {
+                            let rec = if item.valid {
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let ts_rel = (item.ts - base_ms) as u64;
+                                let key = ((pid as u64) << 40) | ts_rel;
+                                let cat_price = ((item.cat as u64) << 32) | (item.price as u32 as u64);
+                                EvRec { key, cat_price }
+                            } else {
+                                EvRec { key: 0, cat_price: (INVALID as u64) << 32 }
+                            };
+                            let row = payload.len() as u32;
+                            payload.push(EventPayload { id: item.id, rec });
+                            let loc = ((ci as u64) << 32) | (row as u64);
+                            out[(item.h >> SH1) as usize].push(EvKey { h: item.h, ingest: item.ingest, loc });
+                        }
+                    };
+
+                    for_lines_split::<7>(d, first, &mut f, |_l, f, _q| {
+                        if let Some(id) = f[0] {
+                            if id.is_empty() { return; }
+                            let h = xxh3_64(id);
+                            let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
+
+                            let mut valid = false;
+                            let mut user: S = &[];
+                            let mut user_h = 0u64;
+                            let mut lo = 0u64;
+                            let mut hi = 0u64;
+                            let mut ts = 0i64;
+                            let mut cat = INVALID;
+                            let mut price = 0i64;
+
+                            if let (Some(u), Some(t_str), Some(e_str), Some(prod)) = (f[1], f[2], f[4], f[5]) {
+                                if !u.is_empty() && !prod.is_empty() {
+                                    let et = match e_str.first() {
+                                        Some(b'v') if e_str == b"view" => 1,
+                                        Some(b'c') if e_str == b"cart" => 2,
+                                        Some(b'p') if e_str == b"purchase" => 3,
+                                        _ => 0,
+                                    };
+                                    if et != 0 {
+                                        if let Some(t) = parse_ts(t_str) {
+                                            if t >= ws && t < we && ingest.saturating_sub(t) <= DAY {
+                                                if et == 3 {
+                                                    let pr = parse_price(f[6]);
+                                                    if pr >= 1 {
+                                                        user = u;
+                                                        let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                        lo = l;
+                                                        hi = h_val;
+                                                        user_h = hash16(lo, hi);
+                                                        ts = t;
+                                                        price = pr;
+                                                        cat = *prod_cat.get(prod).unwrap_or(&unknown);
+                                                        valid = true;
+                                                    }
+                                                } else {
+                                                    // 97% pushdown projection: skip parse_price and prod_cat hash lookup completely
+                                                    user = u;
+                                                    let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                    lo = l;
+                                                    hi = h_val;
+                                                    user_h = hash16(lo, hi);
+                                                    ts = t;
+                                                    price = 0;
+                                                    cat = u32::MAX;
+                                                    valid = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            batch[batch_len] = EventBatchItem {
+                                id,
+                                h,
+                                ingest,
+                                user,
+                                user_h,
+                                lo,
+                                hi,
+                                ts,
+                                cat,
+                                price,
+                                valid,
+                            };
+                            batch_len += 1;
+                            if batch_len == EVENT_BATCH {
+                                flush_events(&batch, batch_len, &mut payload, &mut out);
+                                batch_len = 0;
+                            }
+                        }
+                    });
+                    if batch_len > 0 {
+                        flush_events(&batch, batch_len, &mut payload, &mut out);
+                    }
+                    (payload, out)
+                })
+                .unzip();
+            log(&t0, "events parsed");
+            let payloads_ref = &payloads;
+            let (survivors, counts): (Vec<Vec<EvRec>>, Vec<[u32; NB2]>) = (0..NB1)
+                .into_par_iter()
+                .map(|b| {
+                    let n: usize = keys_per_chunk.iter().map(|k| k[b].len()).sum();
+                    let mut keys: Vec<EvKey> = Vec::with_capacity(n);
+                    for k in &keys_per_chunk {
+                        keys.extend_from_slice(&k[b]);
+                    }
+                    keys.sort_unstable_by_key(|k| (k.h, k.ingest, k.loc));
+                    let mut surv = Vec::with_capacity(n);
+                    let mut cnt = [0u32; NB2];
+                    let mut emit = |p: &EventPayload| {
+                        let pb_idx = ((p.rec.key >> 40) & 255) as usize;
+                        cnt[pb_idx] += 1;
+                        surv.push(p.rec);
+                    };
+                    let mut s = 0;
+                    while s < keys.len() {
+                        let mut e = s + 1;
+                        while e < keys.len() && keys[e].h == keys[s].h {
+                            e += 1;
+                        }
+                        let g = &mut keys[s..e];
+                        if g.len() == 1 {
+                            let ci = (g[0].loc >> 32) as usize;
+                            let row = (g[0].loc as u32) as usize;
+                            let p = &payloads_ref[ci][row];
+                            if p.rec.is_valid() {
+                                emit(p);
+                            }
+                        } else {
+                            let ci0 = (g[0].loc >> 32) as usize;
+                            let row0 = (g[0].loc as u32) as usize;
+                            let id0 = payloads_ref[ci0][row0].id;
+                            let all_same = g[1..].iter().all(|k| {
+                                let ci = (k.loc >> 32) as usize;
+                                let row = (k.loc as u32) as usize;
+                                eqs(payloads_ref[ci][row].id, id0)
+                            });
+                            if all_same {
+                                let p0 = &payloads_ref[ci0][row0];
+                                if p0.rec.is_valid() {
+                                    emit(p0);
+                                }
+                            } else {
+                                g.sort_by(|x, y| {
+                                    let px = &payloads_ref[(x.loc >> 32) as usize][(x.loc as u32) as usize];
+                                    let py = &payloads_ref[(y.loc >> 32) as usize][(y.loc as u32) as usize];
+                                    px.id.cmp(py.id).then(x.ingest.cmp(&y.ingest)).then(x.loc.cmp(&y.loc))
+                                });
+                                let p0 = &payloads_ref[(g[0].loc >> 32) as usize][(g[0].loc as u32) as usize];
+                                if p0.rec.is_valid() {
+                                    emit(p0);
+                                }
+                                for w in 1..g.len() {
+                                    let prev = &payloads_ref[(g[w - 1].loc >> 32) as usize][(g[w - 1].loc as u32) as usize];
+                                    let curr = &payloads_ref[(g[w].loc >> 32) as usize][(g[w].loc as u32) as usize];
+                                    if !eqs(curr.id, prev.id) {
+                                        if curr.rec.is_valid() {
+                                            emit(curr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        s = e;
+                    }
+                    (surv, cnt)
+                })
+                .unzip();
+            drop(keys_per_chunk);
+            drop(payloads);
+
+            let mut offsets: Vec<[usize; NB2]> = vec![[0; NB2]; NB1];
+            let mut totals = [0usize; NB2];
+            for p in 0..NB2 {
+                let mut sum = 0usize;
+                for b in 0..NB1 {
+                    offsets[b][p] = sum;
+                    sum += counts[b][p] as usize;
+                }
+                totals[p] = sum;
+            }
+
+            let mut pb: Vec<Vec<EvRec>> = totals
+                .iter()
+                .map(|&tot| {
+                    let mut v = Vec::with_capacity(tot);
+                    unsafe { v.set_len(tot); }
+                    v
+                })
+                .collect();
+
+            struct RawPtr(*mut EvRec);
+            unsafe impl Send for RawPtr {}
+            unsafe impl Sync for RawPtr {}
+
+            {
+                let ptrs: Vec<RawPtr> = pb.iter_mut().map(|v| RawPtr(v.as_mut_ptr())).collect();
+                (0..NB1).into_par_iter().for_each(|b| {
+                    let mut cur_offsets = offsets[b];
+                    for rec in &survivors[b] {
+                        let pid = (rec.key >> 40) as usize;
+                        let p = pid & 255;
+                        let pos = cur_offsets[p];
+                        cur_offsets[p] += 1;
+                        unsafe {
+                            *ptrs[p].0.add(pos) = *rec;
+                        }
+                    }
+                });
+            }
+            drop(survivors);
+
+            pb.par_iter_mut().for_each(|v| {
+                v.sort_unstable_by_key(|e| e.key);
+            });
+            log(&t0, &format!("events valid: {}", pb.iter().map(|v| v.len()).sum::<usize>()));
+            pb
+        },
+        || {
+            const CLICK_BATCH: usize = 32;
+
+            #[derive(Clone, Copy)]
+            struct ClickBatchItem {
+                id: S,
+                user: S,
+                user_h: u64,
+                lo: u64,
+                hi: u64,
+                camp: u32,
+                ts: i64,
+                valid: bool,
+            }
+
+            const DUMMY_CLICK: ClickBatchItem = ClickBatchItem {
+                id: &[],
+                user: &[],
+                user_h: 0,
+                lo: 0,
+                hi: 0,
+                camp: 0,
+                ts: 0,
+                valid: false,
+            };
+
+            let (survivors, counts): (Vec<Vec<CkRec>>, Vec<[u32; NB2]>) = cchunks
+                .par_iter()
+                .map(|&(d, first)| {
+                    let mut surv: Vec<CkRec> = Vec::with_capacity(d.len() / 50 + 16);
+                    let mut cnt = [0u32; NB2];
+                    let mut f = [None; 4];
+                    let mut batch = [DUMMY_CLICK; CLICK_BATCH];
+                    let mut batch_len = 0;
+
+                    let flush_clicks = |batch: &[ClickBatchItem; CLICK_BATCH], len: usize, cnt: &mut [u32; NB2], surv: &mut Vec<CkRec>| {
+                        if len == 0 { return; }
+                        for item in &batch[..len] {
+                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                                let slot_ptab = (item.user_h as usize) & ptab.mask;
+                                let slot_intern = (item.user_h as usize) & interner_ref.mask;
+                                unsafe {
+                                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                                    let p1 = ptab.slots.as_ptr().add(slot_ptab) as *const i8;
+                                    _mm_prefetch(p1, _MM_HINT_T0);
+                                    let p2 = interner_ref.slots.as_ptr().add(slot_intern) as *const i8;
+                                    _mm_prefetch(p2, _MM_HINT_T0);
+                                }
+                            }
+                        }
+
+                        for item in &batch[..len] {
+                            if item.valid {
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let ts_rel = (item.ts - base_ms) as u64;
+                                let key = ((pid as u64) << 40) | ts_rel;
+                                let p = (pid & 255) as usize;
+                                cnt[p] += 1;
+                                surv.push(CkRec { key, camp: item.camp, id: item.id });
+                            }
+                        }
+                    };
+
+                    for_lines_split::<4>(d, first, &mut f, |_l, f, _q| {
+                        if let Some(id) = f[0] {
+                            if id.is_empty() { return; }
+                            let mut valid = false;
+                            let mut user: S = &[];
+                            let mut user_h = 0u64;
+                            let mut lo = 0u64;
+                            let mut hi = 0u64;
+                            let mut camp = 0u32;
+                            let mut ts = 0i64;
+
+                            if let (Some(u), Some(c), Some(t_str)) = (f[1], f[2], f[3]) {
+                                if !u.is_empty() {
+                                    if let Some(t) = parse_ts(t_str) {
+                                        if t >= ws - WEEK && t < we {
+                                            if let Some(&cmp) = camp_id.get(c) {
+                                                user = u;
+                                                let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                lo = l;
+                                                hi = h_val;
+                                                user_h = hash16(lo, hi);
+                                                camp = cmp;
+                                                ts = t;
+                                                valid = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            batch[batch_len] = ClickBatchItem {
+                                id,
+                                user,
+                                user_h,
+                                lo,
+                                hi,
+                                camp,
+                                ts,
+                                valid,
+                            };
+                            batch_len += 1;
+                            if batch_len == CLICK_BATCH {
+                                flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
+                                batch_len = 0;
+                            }
+                        }
+                    });
+                    if batch_len > 0 {
+                        flush_clicks(&batch, batch_len, &mut cnt, &mut surv);
+                    }
+                    (surv, cnt)
+                })
+                .unzip();
+
+            let mut offsets: Vec<[usize; NB2]> = vec![[0; NB2]; cchunks.len()];
+            let mut totals = [0usize; NB2];
+            for p in 0..NB2 {
+                let mut sum = 0usize;
+                for b in 0..cchunks.len() {
+                    offsets[b][p] = sum;
+                    sum += counts[b][p] as usize;
+                }
+                totals[p] = sum;
+            }
+
+            let mut cb: Vec<Vec<CkRec>> = totals
+                .iter()
+                .map(|&tot| {
+                    let mut v = Vec::with_capacity(tot);
+                    unsafe { v.set_len(tot); }
+                    v
+                })
+                .collect();
+
+            struct RawPtr(*mut CkRec);
+            unsafe impl Send for RawPtr {}
+            unsafe impl Sync for RawPtr {}
+
+            {
+                let ptrs: Vec<RawPtr> = cb.iter_mut().map(|v| RawPtr(v.as_mut_ptr())).collect();
+                (0..cchunks.len()).into_par_iter().for_each(|b| {
+                    let mut cur_offsets = offsets[b];
+                    for rec in &survivors[b] {
+                        let pid = (rec.key >> 40) as usize;
+                        let p = pid & 255;
+                        let pos = cur_offsets[p];
+                        cur_offsets[p] += 1;
+                        unsafe {
+                            *ptrs[p].0.add(pos) = *rec;
+                        }
+                    }
+                });
+            }
+            drop(survivors);
+
+            cb.par_iter_mut().for_each(|v| {
+                v.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| a.id.cmp(b.id)));
+                v.dedup_by(|a, b| a.key == b.key && eqs(a.id, b.id));
+            });
+            log(&t0, &format!("clicks valid: {}", cb.iter().map(|v| v.len()).sum::<usize>()));
+            cb
+        },
     );
-    drop(keys_per_chunk);
-    drop(payloads);
 
     let full_names = build_names(&interner, &root_names);
     log(&t0, &format!("total persons (pids): {}", full_names.len()));
@@ -1671,7 +1763,9 @@ fn main() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    std::process::exit(0);
+    unsafe {
+        libc::_exit(0);
+    }
 }
 
 fn write_outputs(
