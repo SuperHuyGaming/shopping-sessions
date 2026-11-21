@@ -805,70 +805,87 @@ fn main() {
     }
     let ncamp = camp_names.len();
 
-    // links -> union-find; root = byte-wise smallest id
-    let lchunks = chunks(&data.join("links"));
-    let pairs: Vec<(S, S)> = lchunks
-        .par_iter()
-        .flat_map_iter(|&(d, first)| {
-            let mut v = Vec::new();
-            let mut f = [None; 2];
-            for_lines(d, first, |l| {
-                if split(l, &mut f) {
-                    if let (Some(a), Some(b)) = (f[0], f[1]) {
-                        v.push((a, b));
+    // links -> PTab built on its own thread, overlapped with events parsing (events resolve persons after dedup)
+    static PT: std::sync::OnceLock<PTab> = std::sync::OnceLock::new();
+    let ldir = data.join("links");
+    let lh = std::thread::spawn(move || {
+        let data_links = ldir;
+        // links -> union-find; root = byte-wise smallest id
+        let lchunks = chunks(&data_links);
+        let pairs: Vec<(S, S)> = lchunks
+            .iter()
+            .flat_map(|&(d, first)| {
+                let mut v = Vec::new();
+                let mut f = [None; 2];
+                for_lines(d, first, |l| {
+                    if split(l, &mut f) {
+                        if let (Some(a), Some(b)) = (f[0], f[1]) {
+                            v.push((a, b));
+                        }
                     }
-                }
+                });
+                v
+            })
+            .collect();
+        let mut idx: Map<S, u32> = Map::default();
+        let mut names: Vec<S> = Vec::new();
+        let mut parent: Vec<u32> = Vec::new();
+        fn find(p: &mut [u32], mut x: u32) -> u32 {
+            let mut r = x;
+            while p[r as usize] != r {
+                r = p[r as usize];
+            }
+            while p[x as usize] != r {
+                let n = p[x as usize];
+                p[x as usize] = r;
+                x = n;
+            }
+            r
+        }
+        for &(a, b) in &pairs {
+            let ia = *idx.entry(a).or_insert_with(|| {
+                names.push(a);
+                parent.push(names.len() as u32 - 1);
+                names.len() as u32 - 1
             });
-            v
-        })
-        .collect();
-    let mut idx: Map<S, u32> = Map::default();
-    let mut names: Vec<S> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    fn find(p: &mut [u32], mut x: u32) -> u32 {
-        let mut r = x;
-        while p[r as usize] != r {
-            r = p[r as usize];
-        }
-        while p[x as usize] != r {
-            let n = p[x as usize];
-            p[x as usize] = r;
-            x = n;
-        }
-        r
-    }
-    for &(a, b) in &pairs {
-        let ia = *idx.entry(a).or_insert_with(|| {
-            names.push(a);
-            parent.push(names.len() as u32 - 1);
-            names.len() as u32 - 1
-        });
-        let ib = *idx.entry(b).or_insert_with(|| {
-            names.push(b);
-            parent.push(names.len() as u32 - 1);
-            names.len() as u32 - 1
-        });
-        let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-        if ra != rb {
-            if names[ra as usize] < names[rb as usize] {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
+            let ib = *idx.entry(b).or_insert_with(|| {
+                names.push(b);
+                parent.push(names.len() as u32 - 1);
+                names.len() as u32 - 1
+            });
+            let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+            if ra != rb {
+                if names[ra as usize] < names[rb as usize] {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
+                }
             }
         }
-    }
-    // flat open-addressing table: id bytes inline (<=16 B), person + its hash stored in the slot
-    let mut cap = 1usize;
-    while cap < names.len() * 2 + 16 {
-        cap <<= 1;
-    }
-    let mut ptab = PTab { mask: cap - 1, slots: vec![Slot::default(); cap], long: Map::default() };
-    for i in 0..names.len() as u32 {
-        let r = find(&mut parent, i);
-        ptab.insert(names[i as usize], names[r as usize]);
-    }
-    log(&t0, &format!("links: {} pairs, {} ids", pairs.len(), names.len()));
-    let ptab = &ptab;
+        // flat open-addressing table: id bytes inline (<=16 B), person + its hash stored in the slot
+        let mut cap = 1usize;
+        while cap < names.len() * 2 + 16 {
+            cap <<= 1;
+        }
+        let mut ptab = PTab { mask: cap - 1, slots: vec![Slot::default(); cap], long: Map::default() };
+        for i in 0..names.len() as u32 {
+            let r = find(&mut parent, i);
+            ptab.insert(names[i as usize], names[r as usize]);
+        }
+        log(&t0, &format!("links: {} pairs, {} ids", pairs.len(), names.len()));
+        let _ = PT.set(ptab);
+    });
+    let lh = std::sync::Mutex::new(Some(lh));
+    let get_pt = || -> &'static PTab {
+        if let Some(p) = PT.get() {
+            return p;
+        }
+        let mut g = lh.lock().unwrap();
+        if let Some(h) = g.take() {
+            h.join().unwrap();
+        }
+        PT.get().unwrap()
+    };
 
 
     // ---------------- events || clicks (independent until the per-person pass) ----------------
@@ -895,7 +912,7 @@ fn main() {
                 if ingest - ts > DAY {
                     return None;
                 }
-                let (ph, person) = ptab.get(user);
+                let (ph, person) = (0u64, user); // resolved after dedup (phase B)
                 let cat = if et == 3 { *prod_cat.get(prod.unwrap()).unwrap_or(&unknown) } else { u32::MAX };
                 Some(VE { ph, person, ts, cat, price })
             };
@@ -934,9 +951,12 @@ fn main() {
                     }
                     keys.sort_unstable_by_key(|k| (k.0, k.1, k.2));
                     let mut out: Vec<Vec<VE>> = (0..NB2).map(|_| Vec::with_capacity(n / NB2 + 16)).collect();
+                    let ptab = get_pt();
                     let mut emit = |r: &Rec| {
                         if r.ve.cat != INVALID {
-                            out[(r.ve.ph >> SH2) as usize].push(r.ve);
+                            let mut ve = r.ve;
+                            (ve.ph, ve.person) = ptab.get(ve.person);
+                            out[(ve.ph >> SH2) as usize].push(ve);
                         }
                     };
                     let mut s = 0;
@@ -983,6 +1003,7 @@ fn main() {
         },
         || {
             let cchunks = chunks(&data.join("clicks"));
+            let ptab = get_pt();
             // v6: BRIEF: "Copies of a click have identical values, so keep any one". So: parse + validate inline,
             // scatter straight into person buckets, sort locally, drop adjacent identical copies.
             let validate = |id: S, user: Option<S>, camp: Option<S>, ts: Option<S>| -> Option<VC> {
