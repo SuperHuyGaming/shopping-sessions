@@ -122,6 +122,12 @@ impl<T: Copy> Parts<T> {
         self.st.as_ptr().wrapping_add(p) as *const u8
     }
 
+    /// Prefetches partition p's write state (to reduce memory stalls when writing to p).
+    #[inline(always)]
+    pub fn prefetch_part(&self, p: usize) {
+        prefetch_w(self.st.as_ptr().wrapping_add(p) as *const u8);
+    }
+
     /// Where partition p's next record will be written (meaningless before its first chunk).
     #[inline(always)]
     pub fn peek(&self, p: usize) -> *const T {

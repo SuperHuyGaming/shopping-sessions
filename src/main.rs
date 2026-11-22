@@ -2166,6 +2166,8 @@ trait EvSink {
     fn slot(&mut self, eid: u64) -> *mut EvRec;
     fn commit(&mut self, eid: u64, d: *mut EvRec);
     #[inline(always)]
+    fn prefetch_part(&self, _eid: u64) {}
+    #[inline(always)]
     fn push_rec(&mut self, eid: u64, r: EvRec) -> *mut EvRec {
         let d = self.slot(eid);
         unsafe { d.write(r) };
@@ -2198,6 +2200,10 @@ impl EvSink for PartSink {
     #[inline(always)]
     fn push_rec(&mut self, eid: u64, r: EvRec) -> *mut EvRec {
         self.ev.push_pf((eid >> self.eshift) as usize, r, 2)
+    }
+    #[inline(always)]
+    fn prefetch_part(&self, eid: u64) {
+        self.ev.prefetch_part((eid >> self.eshift) as usize);
     }
 }
 
@@ -2858,6 +2864,7 @@ fn parse_events<S: EvSink>(d: &[u8], start: usize, end: usize, cx: &PCtx, dc: &m
             slow!();
         }
         let (eid, eref) = eid_key(sl(eid_at, l0), dc);
+        sink.prefetch_part(eid);
         // a user ID that is not of the short form gets its key at the end of the row
         let user = if l1 != 0 {
             match key_short(sl(user_at, l1), PFX_USER) {
@@ -3143,6 +3150,7 @@ fn main() {
                             }
                             parse_events(c.data, c.start, c.end, &cx, &mut dcache, &mut es);
                         } else {
+                            cl.reserve((c.end - c.start) / 45);
                             rows4(c.data, c.start, c.end, #[inline(always)] |f| {
                                 if f[0].is_empty() || f[1].is_empty() {
                                     return;
