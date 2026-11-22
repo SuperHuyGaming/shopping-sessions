@@ -2345,7 +2345,8 @@ impl<'a> PSink<'a> {
 }
 
 fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
-    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(chunks.len() * 150_000);
+    let link_bytes: usize = chunks.iter().map(|c| c.end - c.start).sum();
+    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(link_bytes / 25 + 16);
     // Long IDs get their keys a few rows later (their table slots are cache misses,
     // asked for when the ID is read): (pair, side, the ID's two numbers).
     let mut ring = [(0usize, 0usize, 0u64, 0u64); PEND];
@@ -2482,13 +2483,22 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
             }
         }
         let r = find(&mut parent, i as u32) as usize;
+        parent[i] = r as u32;
         if best[r] == EMPTY || key_cmp(keys[i], best[r], PFX_USER) == std::cmp::Ordering::Less {
             best[r] = keys[i];
         }
     }
-    let t_names = t0.elapsed();
-    let mut pm = PMap::new(n);
     let mut nmap = 0;
+    for i in 0..n {
+        if i + AHEAD < n {
+            prefetch(best.as_ptr().wrapping_add(parent[i + AHEAD] as usize));
+        }
+        if best[parent[i] as usize] != keys[i] {
+            nmap += 1;
+        }
+    }
+    let t_names = t0.elapsed();
+    let mut pm = PMap::new(nmap);
     for i in 0..n {
         if i + AHEAD < n {
             prefetch(best.as_ptr().wrapping_add(parent[i + AHEAD] as usize));
@@ -2497,7 +2507,6 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
         let b = best[parent[i] as usize];
         if b != keys[i] {
             pm.insert(keys[i], b);
-            nmap += 1;
         }
     }
     eprintln!(
