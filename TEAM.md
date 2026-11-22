@@ -2,4 +2,4 @@
 
 Name: GMUNVIS
 Members: Huy Truong, Khang Nguyen
-Engine: Rust (native, multithreaded)
+Engine: Rust (custom express + verified zero-alloc fallback)

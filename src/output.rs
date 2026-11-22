@@ -49,9 +49,10 @@ impl Column {
         Self::new(name, INT32, Logical::None, false, rows)
     }
 
-    /// An integer column of `values`: always INT64 per rules.md spec.
+    /// An integer column of `values`: INT32 when every value fits (smaller files;
+    /// any integer width is accepted), else INT64.
     pub fn integers(name: &'static str, values: &[i64]) -> Self {
-        let narrow = false;
+        let narrow = values.iter().all(|&v| v == v as i32 as i64);
         let mut c = if narrow { Self::int32s(name, values.len()) } else { Self::int64s(name, values.len()) };
         for &v in values {
             if narrow {

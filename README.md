@@ -1,83 +1,61 @@
-# Shopping Sessions: DuckDB starter
+# Shopping Sessions
 
-This repository is a working skeleton, not a complete solution. It builds a `linux/amd64` image with DuckDB, runs inside the scorer's container limits, reads the inputs, and writes both output tables with the right schema. Both tables are empty, so the checker marks this skeleton incorrect until you implement the rules in `rules.md`.
+A single static Rust binary that turns the dirty click-stream CSVs in `/data` into the two exact daily
+Parquet tables `/output/user_daily/` and `/output/campaign_daily/`, following `rules.md`.
 
-If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
+## Credits and layout
 
-## What to do first
+- **`express/`: the pipeline in the image.** It is based on Team 67's Express Lane
+  (github.com/jason-scheffel/express-lane, commit 92cf412), used under the MIT License; Team 67's
+  copyright notice is kept in `LICENSE`. It infers a compact ID representation from the input, checks
+  it as it goes, and re-runs itself in an exact generic mode when the data breaks its assumptions.
+  Our changes to it are in the git history after the commit that imports it. It needs AVX-512
+  (built for Cascade Lake, the scorer's CPU).
+- **Profile-guided optimization, tried and dropped.** `scripts/pgo/` builds an instrumented pipeline
+  (feature `pgo-gen`) and merges its profile on never-scored generator seeds; a scorer A/B (BENCH.md,
+  P8) found no measurable gain, so the image is built without it.
+- **`probe/`: scorer A/B measurements** (`scripts/probe/`, used only in probe commits, never a candidate).
+- **`src/`, `generic/`: our own earlier pipeline** (scored 1.01 s, commit 14b4668), described below.
+  It is kept in the repository and its tests, but it is not in the image.
 
-- Read `rules.md` for the full rules.
-- Write your pipeline in `pipeline/pipeline.py`. The TODO lists the steps in order.
-- Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
+## Our earlier pipeline (`src/`)
 
-## Run and test locally
+All phases run on `NCPU` threads over memory-mapped inputs split into line-aligned chunks.
 
-You need Docker with buildx, and Python 3.10+ with `polars` for the test scripts. Install it with `pip install polars`.
+1. **Lookups.** `manifest.json`, `products.csv` and `campaigns.csv`. Category ids follow byte-wise name order
+   (with `unknown`), so top-category ties resolve to the smallest id.
+2. **IDs as exact 64-bit keys.** An ID of 1 to 10 bytes in `[0-9A-Z_a-z]` is packed 6 bits per byte, so
+   integer order is byte order. Any other ID is interned and compared by its bytes.
+3. **Links.** Parsed in parallel, then a union-find names every person by the byte-wise smallest of their
+   IDs. This runs on one thread while the others parse events and clicks.
+4. **Events.** Each well-formed copy is validated on its own fields (window, type, product, price, late
+   check) and scattered by `event_id`. Clicks are validated (form of `ts`, campaign known) and kept.
+5. **Dedup.** Per `event_id` partition, the copy with the smallest `ingest_ts` wins. Surviving kept copies
+   are mapped to their person and scattered by person, and so are clicks.
+6. **Sessions.** Per person partition: sort by time, split on gaps over 30 minutes, credit the latest click
+   in the 7 days up to the session start (ties to the smallest `click_id`), and count assists from a
+   sliding window of per-campaign counts.
+7. **Output.** Each thread writes its own `user_daily` file; `campaign_daily` is merged and written once.
 
-Build the image and run all 36 fixtures:
+## Build and run
 
 ```sh
-make build        # docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
-make fixtures     # runs the image on all 36 fixtures with scorer flags, diffs each against expected/
+docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+python scripts/docker_run.py DATA_DIR OUTPUT_DIR     # scorer flags; also scripts/docker_run.sh
 ```
 
-Build, run, and check the 1M-event dev set. `make dev` needs `generate` on your PATH: build it from the track page's generator.zip (Rust 1.85 or newer; its README has the two commands).
+Without Docker: `cargo build --release`, then `target/release/shopping-sessions DATA_DIR OUTPUT_DIR`
+(or set `DATA_DIR` / `OUTPUT_DIR`).
 
-```sh
-make dev                                # generate --seed 1 --events 1000000 --clicks 250000 --output dev
-make run-dev                            # runs your image on dev/ with scorer flags and times it
-make check-dev                          # exact diff against dev-answer/, the track page's dev-answer.zip unzipped here
-```
+## Testing
 
-If your laptop cannot spare 8 cores and 24 GB, run with lower limits using `make run-dev CPUS=4 MEM=8g`. Your local times will not match the scorer anyway; only the board's times count.
+- `cargo test --release`: unit tests for timestamps, the CSV dialect, chunking and key order.
+- `python scripts/run_fixtures.py fixtures -- <binary>`: the 36 edge-case fixtures.
+- `python scripts/compare.py OUT dev-answer`: exact diff against the published dev answer.
+- `reference/reference.py`: an independent, literal, slow implementation of `rules.md`, used as an oracle.
+- `python scripts/diff_seeds.py GENERATE BINARY ROOT`: pipeline vs reference over many generator seeds
+  (including windows holding Feb 29 2028, Mar 1 and New Year) and thread/partition settings.
+- `python scripts/fuzz.py BINARY`: thousands of small adversarial datasets, pipeline vs reference, with
+  random thread counts, chunk sizes down to 1 byte and partition counts.
 
-- **x86 Linux and Windows machines.** Build and run the amd64 image natively.
-- **Apple-silicon Macs.** Emulating amd64 is slow. For fast local loops, build a native image with `make build run-dev PLATFORM=linux/arm64`. The Dockerfile pins no platform, so it builds either way. Check the amd64 image before you submit.
-
-To iterate without Docker:
-
-```sh
-pip install duckdb==1.5.6
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
-```
-
-## Submitting and scoring
-
-Submit your public GitHub repository on the Buildathon track page. Enter a commit SHA to score a specific revision, or leave it empty to score the newest commit on the default branch.
-
-The image's `CMD` runs with no arguments. Exit code 0 means "done, check my output". Build time is never timed; only the run is timed. The track page lists the current practice limits and how the final is scored.
-
-## Container limits
-
-Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX-512 available. Your container gets:
-
-| Resource | Setting |
-| --- | --- |
-| `/data` | The dataset, read-only |
-| `/output` | Empty, writable. Write `/output/user_daily/` and `/output/campaign_daily/` as Parquet |
-| `/scratch` | Empty, writable, fast local disk for spills and temp files |
-| CPU / RAM | 8 vCPUs, hyperthreads of an Intel Xeon, 24 GB, no swap |
-| Network | None |
-| Env vars | `DATA_DIR=/data`, `OUTPUT_DIR=/output`, `SCRATCH_DIR=/scratch`, `HOME=/scratch`, `NCPU=8`, `MEM_GB=24` |
-| Filesystem | Root is read-only apart from `/tmp`, 64 MB in memory. The process runs as uid 1000, not root |
-
-## Common pitfalls
-
-- **DuckDB's CSV reader differs from `rules.md`.** It reads a quoted empty field `""` as an empty string, not null. Its malformed-line handling, including `ignore_errors`, `strict_mode`, and `null_padding`, does not match `rules.md`. Test against the fixtures before relying on it.
-- **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
-- **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
-- **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
-- **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
-
-## Self-checks
-
-- Summed over all rows, `sessions` and `revenue_cents` are equal in both tables.
-- `day` must be a Parquet `DATE`, not a string or timestamp.
-- Row order and the number of Parquet files do not matter. Exact column names do, and there must be no extra columns.
-
-## Files in this starter
-
-- `pipeline/pipeline.py` holds your pipeline code.
-- `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
-- `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
-- `scripts/` runs your image the way the scorer does and diffs the output.
+Knobs for testing only: `NCPU`, `SS_CHUNK` (chunk bytes), `SS_PARTS` (partition count).
