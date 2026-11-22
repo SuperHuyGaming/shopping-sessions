@@ -1,0 +1,5 @@
+target/
+out/
+dev/
+.git
+*.md
