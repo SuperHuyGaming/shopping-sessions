@@ -419,6 +419,8 @@ fn main() {
                 s.push_str(&format!("{n}={ms:.1} "));
             }
             eprintln!("[v3b] setup ms: {s}; exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            #[cfg(feature = "tl")]
+            sys::tl::report(t0);
         }
         match std::env::var("XL_PMX").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2) {
             1 => sys::exit_release(g.nt, unsafe { &parse::FDS }),

@@ -6572,6 +6572,8 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
     let mut lap = |name: &'static str| {
         let now = std::time::Instant::now();
         laps.push((name, (now - last).as_secs_f64() * 1e3));
+        #[cfg(feature = "tl")]
+        unsafe { (*std::ptr::addr_of_mut!(crate::sys::tl::LAPT)).push((name, crate::sys::tl::now())) };
         if timing {
             let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
             let mut w = s.split_whitespace().skip(1).map(|x| x.parse::<usize>().unwrap_or(0));
@@ -6797,6 +6799,13 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
     let ud = out.join("user_daily");
     let cd = out.join("campaign_daily");
     cx.next.store(0, Ordering::Relaxed);
+    let mut cats = StrBuf::new();
+    for c in &g.cats {
+        cats.push(c);
+    }
+    let dirs_ok = std::sync::atomic::AtomicBool::new(false);
+    let p2_left = AtomicUsize::new(nt);
+    let wclaim: Vec<std::sync::atomic::AtomicBool> = (0..nt).map(|_| std::sync::atomic::AtomicBool::new(false)).collect();
     run_par(nt, |tid| {
         if tid == nt - 1 {
             if std::fs::create_dir_all(&ud).is_err() || std::fs::create_dir_all(&cd).is_err() {
@@ -6804,34 +6813,40 @@ pub fn run(g: &G, outdir: &str, timing: bool) {
             }
             clear_parquet(&ud);
             clear_parquet(&cd);
+            dirs_ok.store(true, Ordering::Release);
         }
-        p2_thread(&cx, tid)
-    });
-    lap("p2");
-    let mut acc = vec![[0u64; 4]; nacc];
-    for tid in 0..nt {
-        let t = cx.t(tid);
-        for (i, a) in acc.iter_mut().enumerate() {
-            a[0] += t.acc.ses[i] as u64 + t.acc.ses_hi[i];
-            a[1] += t.acc.pur[i][0];
-            a[2] += t.acc.pur[i][1];
-            a[3] += t.acc.asst[i] as u64;
+        p2_thread(&cx, tid);
+        while !dirs_ok.load(Ordering::Acquire) {
+            std::hint::spin_loop();
         }
-    }
-    let mut cats = StrBuf::new();
-    for c in &g.cats {
-        cats.push(c);
-    }
-    lap("wprep");
-    run_par(nt, |tid| {
         let mut tk = std::time::Instant::now();
-        if tid == 0 {
+        if p2_left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let mut acc = vec![[0u64; 4]; nacc];
+            for o in 0..nt {
+                let t = cx.t(o);
+                for (i, a) in acc.iter_mut().enumerate() {
+                    a[0] += t.acc.ses[i] as u64 + t.acc.ses_hi[i];
+                    a[1] += t.acc.pur[i][0];
+                    a[2] += t.acc.pur[i][1];
+                    a[3] += t.acc.asst[i] as u64;
+                }
+            }
             write_campaigns(&cd.join("part-0.parquet"), g, &acc);
             cx.t(tid).prof[11] += tick(&mut tk);
         }
-        write_users(&ud.join(format!("part-{tid}.parquet")), &cx.t(tid).rows, &cats);
+        for j in 0..nt {
+            let k = (tid + j) % nt;
+            if j > 0 && p2_left.load(Ordering::Acquire) != 0 {
+                break;
+            }
+            if !wclaim[k].swap(true, Ordering::AcqRel) {
+                write_users(&ud.join(format!("part-{k}.parquet")), &cx.t(k).rows, &cats);
+            }
+        }
         cx.t(tid).prof[12] += tick(&mut tk);
     });
+    lap("p2");
+    lap("wprep");
     lap("write");
     if timing {
         let mut s = String::new();
