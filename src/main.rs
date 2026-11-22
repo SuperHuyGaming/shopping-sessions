@@ -911,7 +911,7 @@ fn tod_checked(w: u64) -> Option<u64> {
 /// Per-thread cache of validated dates ("YYYY-MM-DD" -> day number). A dataset has
 /// only a few dozen distinct dates, so each timestamp mostly parses only its time.
 struct DateCache {
-    entries: [(u64, i64); 256],
+    entries: [(u64, i64); 32],
     /// first numbers of the long event IDs this thread parsed (`eid_key`)
     long_hi: Vec<u64>,
     /// this thread's number, below EREF_MAX_THREADS
@@ -922,7 +922,27 @@ struct DateCache {
 
 impl DateCache {
     fn new() -> Self {
-        DateCache { entries: [(0, i64::MIN); 256], long_hi: Vec::new(), tid: 0, pend: Pending::new() }
+        DateCache { entries: [(0, i64::MIN); 32], long_hi: Vec::new(), tid: 0, pend: Pending::new() }
+    }
+
+    fn new_with_bounds(tb: i64, we: i64) -> Self {
+        const MA: u64 = 0x00FF_FF00_FFFF_FFFF;
+        let mut dc = Self::new();
+        let d0 = tb.div_euclid(DAY);
+        let d1 = (we - 1).div_euclid(DAY).max(d0);
+        for z in d0..=d1 {
+            let (y, _m, d) = civil_from_days(z);
+            if (0..=9999).contains(&y) {
+                let (y_u, m_u, d_u) = (y as usize, _m as usize, d as usize);
+                let t = format!("{:04}-{:02}-{:02}", y_u, m_u, d_u).into_bytes();
+                let a = u64::from_le_bytes([t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]]);
+                let b = u16::from_le_bytes([t[8], t[9]]);
+                let key = (a & MA) | ((b as u64 & 0xFF) << 32) | (((b as u64 >> 8) & 0xFF) << 56);
+                let idx = (d as usize) & 31;
+                dc.entries[idx] = (key, z);
+            }
+        }
+        dc
     }
 
     /// Same result as dt19_swar(p).
@@ -936,7 +956,8 @@ impl DateCache {
         }
         let b = rd64(unsafe { p.add(8) });
         let key = (a & MA) | ((b & 0xFF) << 32) | (((b >> 8) & 0xFF) << 56);
-        let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+        let w = (b as u16) & 0x0F0F;
+        let idx = (((w & 0xFF) * 10 + (w >> 8)) & 31) as usize;
         let days = if self.entries[idx].0 == key && self.entries[idx].1 != i64::MIN {
             self.entries[idx].1
         } else {
@@ -1012,7 +1033,8 @@ impl DateCache {
             let a = rd64(p);
             let b = rd64(unsafe { p.add(8) });
             let key = (a & MA) | ((b & 0xFF) << 32) | (((b >> 8) & 0xFF) << 56);
-            let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+            let w = (b as u16) & 0x0F0F;
+            let idx = (((w & 0xFF) * 10 + (w >> 8)) & 31) as usize;
             let (k, d) = self.entries[idx];
             if k == key && d != i64::MIN {
                 let tod = tod_of_lanes(hms_lanes(rd64(unsafe { p.add(11) })));
@@ -2006,39 +2028,41 @@ fn bucket_sort_ts(e: &mut [u64], tmp: &mut [u64; 256], bshift: u32) {
 
 fn radix_sort_ts(e: &mut [u64], tmp: &mut Vec<u64>) {
     let n = e.len();
+    if n <= 1 {
+        return;
+    }
     if tmp.len() < n {
         tmp.resize(n, 0);
     }
-    let mut cnt = [[0u32; 256]; 4];
+    let mut cnt0 = [0u32; 2048];
+    let mut cnt1 = [0u32; 2048];
+    let mut cnt2 = [0u32; 1024];
     for &x in e.iter() {
-        let t = (x >> 32) as usize;
-        cnt[0][t & 255] += 1;
-        cnt[1][(t >> 8) & 255] += 1;
-        cnt[2][(t >> 16) & 255] += 1;
-        cnt[3][t >> 24] += 1;
+        let t = (x >> 32) as u32;
+        cnt0[(t & 0x7FF) as usize] += 1;
+        cnt1[((t >> 11) & 0x7FF) as usize] += 1;
+        cnt2[(t >> 22) as usize] += 1;
     }
     let first_elem = e[0];
+    let first_t = (first_elem >> 32) as u32;
+
     let mut src: *mut u64 = e.as_mut_ptr();
     let mut dst: *mut u64 = tmp.as_mut_ptr();
     let mut swapped = false;
-    for d in 0..4 {
-        let b = ((first_elem >> (32 + 8 * d)) & 255) as usize;
-        if cnt[d][b] == n as u32 {
-            continue;
-        }
-        let c = &mut cnt[d];
+
+    // Pass 0: bits 0..11
+    if cnt0[(first_t & 0x7FF) as usize] != n as u32 {
         let mut acc = 0u32;
-        for v in c.iter_mut() {
+        for v in cnt0.iter_mut() {
             let k = *v;
             *v = acc;
             acc += k;
         }
-        let sh = 32 + 8 * d;
         for i in 0..n {
             unsafe {
                 let x = *src.add(i);
-                let b = ((x >> sh) & 255) as usize;
-                let at = c.get_unchecked_mut(b);
+                let b = ((x >> 32) & 0x7FF) as usize;
+                let at = cnt0.get_unchecked_mut(b);
                 *dst.add(*at as usize) = x;
                 *at += 1;
             }
@@ -2046,6 +2070,49 @@ fn radix_sort_ts(e: &mut [u64], tmp: &mut Vec<u64>) {
         std::mem::swap(&mut src, &mut dst);
         swapped = !swapped;
     }
+
+    // Pass 1: bits 11..22
+    if cnt1[((first_t >> 11) & 0x7FF) as usize] != n as u32 {
+        let mut acc = 0u32;
+        for v in cnt1.iter_mut() {
+            let k = *v;
+            *v = acc;
+            acc += k;
+        }
+        for i in 0..n {
+            unsafe {
+                let x = *src.add(i);
+                let b = ((x >> 43) & 0x7FF) as usize;
+                let at = cnt1.get_unchecked_mut(b);
+                *dst.add(*at as usize) = x;
+                *at += 1;
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+        swapped = !swapped;
+    }
+
+    // Pass 2: bits 22..32 (10 bits)
+    if cnt2[(first_t >> 22) as usize] != n as u32 {
+        let mut acc = 0u32;
+        for v in cnt2.iter_mut() {
+            let k = *v;
+            *v = acc;
+            acc += k;
+        }
+        for i in 0..n {
+            unsafe {
+                let x = *src.add(i);
+                let b = ((x >> 54) & 0x3FF) as usize;
+                let at = cnt2.get_unchecked_mut(b);
+                *dst.add(*at as usize) = x;
+                *at += 1;
+            }
+        }
+        std::mem::swap(&mut src, &mut dst);
+        swapped = !swapped;
+    }
+
     if swapped {
         unsafe {
             std::ptr::copy_nonoverlapping(src, e.as_mut_ptr(), n);
@@ -3003,7 +3070,7 @@ fn main() {
                 let lk = &lk;
                 sc.spawn(move || {
                     let pmap = if tid == 0 { Some(build_links(link_chunks, t0)) } else { None };
-                    let mut dcache = DateCache::new();
+                    let mut dcache = DateCache::new_with_bounds(tb, we);
                     dcache.tid = tid as u64;
                     let cx = PCtx { lk, ws, we, tb, day_base: tb.div_euclid(DAY) * DAY, days: day_text };
                     let ev: Parts<EvRec> = Parts::with_chunk(npe, block_recs, pch.unwrap_or(if ebits <= 10 { 1024 } else { 512 }));
