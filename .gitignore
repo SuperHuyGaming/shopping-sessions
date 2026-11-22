@@ -1,6 +1,5 @@
-target/
-/data/
-/dev/
-/out/
-__pycache__/
-*.pyc
+build/
+out*/
+data/
+*.parquet
+exp/

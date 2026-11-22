@@ -1,13 +1,5 @@
-target/
-fixtures/
-reference/
-scripts/
-dev/
-out/
-*.md
+build/
+*.parquet
+out*/
+data/
 .git
-generic/target/
-proto/
-express/target/
-v1/target/
-probe/target/
