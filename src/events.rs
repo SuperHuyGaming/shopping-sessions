@@ -2,6 +2,7 @@
 
 use crate::arena::{Scatter, Words3};
 use crate::hash::{bucket, mix};
+use crate::genid;
 use crate::key;
 use crate::links::Names;
 use crate::sessions::PersonClick;
@@ -117,6 +118,11 @@ pub struct Context<'a> {
     pub window_end: i64,
     pub products: &'a Products,
     pub campaigns: &'a Campaigns,
+    /// Generator-ID fast path (see genid): the event key, the counter cap (0 when
+    /// off) and log2 of the counters per event_id partition.
+    pub event_key: u64,
+    pub counter_cap: u64,
+    pub counter_shift: u32,
 }
 
 /// `price_cents` of a purchase: ASCII digits only, 1 to 10,000,000.
@@ -154,8 +160,12 @@ fn decode_event(f: &[&[u8]; 7], cx: &Context) -> Option<EventCopy> {
     if event_id.is_empty() {
         return None;
     }
+    let id = match genid::counter(event_id, cx.event_key, cx.counter_cap) {
+        Some(v) => genid::FAST | v,
+        None => key::key(event_id),
+    };
     let mut copy = EventCopy {
-        event_id: key::key(event_id),
+        event_id: id,
         ingest: ts::ingest(ingest),
         user: 0,
         packed: 0,
@@ -202,7 +212,11 @@ fn decode_event(f: &[&[u8]; 7], cx: &Context) -> Option<EventCopy> {
 
 #[inline(always)]
 fn store_event(copy: EventCopy, cx: &Context, parts: &mut Copies) {
-    let p = bucket(mix(copy.event_id), parts.full.parts());
+    let p = if copy.event_id & genid::FAST != 0 {
+        ((copy.event_id & genid::MASK) >> cx.counter_shift) as usize
+    } else {
+        bucket(mix(copy.event_id), parts.full.parts())
+    };
     let rel = copy.ingest.wrapping_sub(cx.base);
     let seconds = rel / 1000;
     if rel % 1000 == 0 && seconds == seconds as i32 as i64 && copy.packed & PURCHASE == 0 {

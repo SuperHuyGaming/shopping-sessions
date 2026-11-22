@@ -133,6 +133,14 @@ impl Input {
         }
     }
 
+    /// The first `n` bytes (or fewer) of file `file`.
+    pub fn head(&self, file: usize, n: usize) -> Vec<u8> {
+        let n = n.min(self.lens[file] as usize);
+        let mut buf = vec![0u8; n];
+        read_exact_at(&self.files[file], &mut buf, 0);
+        buf
+    }
+
     pub fn bytes(&self) -> u64 {
         self.lens.iter().sum()
     }

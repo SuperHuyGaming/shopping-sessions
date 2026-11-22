@@ -11,6 +11,7 @@
 mod arena;
 mod csv;
 mod events;
+mod genid;
 mod hash;
 mod input;
 mod key;
@@ -117,12 +118,29 @@ fn main() {
     if !compact_ok || std::env::var_os("SS_FORCE_GENERIC").is_some() {
         run_generic(&args);
     }
-    let cx = Context {
+    // Generator-ID fast path: recover the event key from the head of the first
+    // events file (on its own thread, while the links parse) and size counter
+    // ranges so that partition p holds counters [p << shift, (p + 1) << shift).
+    let fast_off = std::env::var_os("SS_NO_GENID").is_some() || event_input.files.is_empty();
+    let sample = if fast_off { Vec::new() } else { event_input.head(0, 256 << 10) };
+    let (counter_cap, counter_shift) = {
+        let lines = sample.iter().filter(|&&c| c == b'\n').count().max(1);
+        let est_lines = (event_bytes as u128 * lines as u128 / sample.len().max(1) as u128) as u64;
+        let need = (est_lines + est_lines / 8 + 1024).div_ceil(eid_parts as u64).max(1);
+        let shift = 64 - (need - 1).leading_zeros();
+        let cap = (eid_parts as u64) << shift;
+        if fast_off || shift > 24 || cap > (1 << 34) { (0, 0) } else { (cap, shift) }
+    };
+    let recovery = (counter_cap > 0).then(|| std::thread::spawn(move || genid::recover(&sample, counter_cap, threads)));
+    let mut cx = Context {
         base,
         window_start: window.start,
         window_end: window.end,
         products: &products,
         campaigns: &campaigns,
+        event_key: 0,
+        counter_cap: 0,
+        counter_shift: 0,
     };
 
     // Phase 1a: links.
@@ -148,6 +166,14 @@ fn main() {
     });
     log(&format!("links parsed: {} pairs", link_pairs.iter().map(Vec::len).sum::<usize>()));
     probe::mark("links");
+    if let Some(Some(key)) = recovery.map(|h| h.join().ok().flatten()) {
+        cx.event_key = key;
+        cx.counter_cap = counter_cap;
+        cx.counter_shift = counter_shift;
+    }
+    log(&format!("genid: cap {}, shift {}", cx.counter_cap, cx.counter_shift));
+    let cx = cx;
+    let counter_shift = (cx.counter_cap > 0).then_some(cx.counter_shift);
 
     // Phase 1b: the names on every thread (SS_NAMES=serial: on thread 0 while the
     // others start parsing), then events and clicks everywhere.
@@ -381,7 +407,7 @@ fn main() {
                             }
                             compact.extend(event_parts.iter().flat_map(|t| t.compact.part(p)));
                             full.extend(event_parts.iter().flat_map(|t| t.full.part(p)));
-                            sessions::dedup(&compact, &full, base, names, &mut table, &mut kept, &mut evs, &mut deferred);
+                            sessions::dedup(&compact, &full, base, counter_shift, names, &mut table, &mut kept, &mut evs, &mut deferred);
                             compact.clear();
                             full.clear();
                             // Partition p is done: its blocks become this thread's

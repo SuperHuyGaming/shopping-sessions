@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 
 use crate::arena::Scatter;
 use crate::events::{category_of, price_of, ts_of, EventCopy, C_SURVIVES, C_TS, PURCHASE, SURVIVES, WEEK};
+use crate::genid;
 use crate::hash::{bucket, mix};
 use crate::key;
 use crate::links::Names;
@@ -57,6 +58,9 @@ impl PersonClick {
 #[derive(Default)]
 pub struct Table {
     slots: Vec<u64>,
+    /// Slots indexed by counter within the partition (genid fast path): the kept
+    /// copy's position (bits 0..32) and the generation (56..64).
+    direct: Vec<u64>,
     generation: u64,
     /// One bit per copy of the partition: set when another copy wins.
     lost: Vec<u64>,
@@ -77,6 +81,7 @@ pub fn dedup(
     compact: &[&[[u64; 3]]],
     full: &[&[EventCopy]],
     base: i64,
+    counter_shift: Option<u32>,
     names: &Names,
     table: &mut Table,
     kept: &mut Vec<PersonEvent>,
@@ -129,6 +134,7 @@ pub fn dedup(
     if table.generation == 256 {
         // the 8-bit generation wrapped: start over from a clean table
         table.slots.iter_mut().for_each(|s| *s = 0);
+        table.direct.iter_mut().for_each(|s| *s = 0);
         table.generation = 1;
     }
     let generation = table.generation << 56;
@@ -136,7 +142,32 @@ pub fn dedup(
     table.lost.resize(n.div_ceil(64), 0);
     let lost = &mut table.lost;
     let slots = &mut table.slots[..size];
+    let span = counter_shift.map_or(0, |s| 1usize << s);
+    if table.direct.len() < span {
+        table.direct.resize(span, 0);
+    }
+    let direct = &mut table.direct[..span];
     let mut insert = |at: u64, event_id: u64, ingest: i64| {
+        if event_id & genid::FAST != 0 {
+            // A counter: its slot is its offset in the partition's counter range
+            // (equal counters are equal IDs, see genid).
+            let i = (event_id as usize) & (span - 1);
+            let s = direct[i];
+            if s >> 56 << 56 != generation {
+                direct[i] = generation | at;
+                return;
+            }
+            let old = s & 0xffff_ffff;
+            let loser = if ingest < copy_at(old).1 {
+                direct[i] = generation | at;
+                old
+            } else {
+                at
+            };
+            let d = dense(loser);
+            lost[d / 64] |= 1 << (d % 64);
+            return;
+        }
         let h = mix(event_id);
         let tag = (h >> 40) << 32; // 24 bits, above the position
         let mut i = h as usize & mask;
