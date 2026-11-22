@@ -1248,7 +1248,9 @@ fn ing_secs(r: &EvRec, tb: i64) -> u64 {
     if r.ing & ING_LAZY == 0 {
         return r.ing & 0xFFFF_FFFF;
     }
-    let day = (tb + r.ts as i64).div_euclid(DAY);
+    let day_base = tb.div_euclid(DAY);
+    let day_rem = (tb - day_base * DAY) as u64;
+    let day = day_base + ((r.ts as u64 + day_rem) / 86_400_000) as i64;
     (day * 86_400) as u64 + tod_of_lanes(hms_lanes(tod_from_nibbles(r.ing & 0xFF_FFFF)))
 }
 
@@ -2343,7 +2345,7 @@ impl<'a> PSink<'a> {
 }
 
 fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
-    let mut pairs: Vec<[u64; 2]> = Vec::new();
+    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(chunks.len() * 150_000);
     // Long IDs get their keys a few rows later (their table slots are cache misses,
     // asked for when the ID is read): (pair, side, the ID's two numbers).
     let mut ring = [(0usize, 0usize, 0u64, 0u64); PEND];
@@ -2387,14 +2389,14 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
     // table and array below is far larger than the cache and hit at random, so each
     // loop asks for what it needs AHEAD items before it uses it.
     const AHEAD: usize = 16;
-    let cap = (npairs * 4 + 16).next_power_of_two();
+    let cap = (npairs * 2 + 16).next_power_of_two();
     let shift = 64 - cap.trailing_zeros();
     let mask = cap - 1;
     // an empty slot has key 0 (no ID has key 0): fresh zero pages, no fill pass
     let mut slots: Vec<[u64; 2]> = vec![[PEMPTY, 0]; cap];
     let home = |k: u64| (k.wrapping_mul(GOLD) >> shift) as usize;
-    let mut keys: Vec<u64> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
+    let mut keys: Vec<u64> = Vec::with_capacity(npairs);
+    let mut parent: Vec<u32> = Vec::with_capacity(npairs);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let p = parent[x as usize];
@@ -2411,26 +2413,38 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
             prefetch(slots.as_ptr().wrapping_add(home(b)));
         }
         let [a, b] = pairs[i];
-        let mut ids = [0u32; 2];
-        for (j, k) in [a, b].into_iter().enumerate() {
-            let mut s = home(k);
-            loop {
-                let kk = slots[s][0];
-                if kk == k {
-                    break;
-                }
-                if kk == PEMPTY {
-                    slots[s] = [k, keys.len() as u64];
-                    parent.push(keys.len() as u32);
-                    keys.push(k);
-                    break;
-                }
-                s = (s + 1) & mask;
+        let mut s_a = home(a);
+        let id_a = loop {
+            let kk = slots[s_a][0];
+            if kk == a {
+                break slots[s_a][1] as u32;
             }
-            ids[j] = slots[s][1] as u32;
-        }
-        prefetch(parent.as_ptr().wrapping_add(ids[0] as usize));
-        prefetch(parent.as_ptr().wrapping_add(ids[1] as usize));
+            if kk == PEMPTY {
+                let idx = keys.len() as u32;
+                slots[s_a] = [a, idx as u64];
+                parent.push(idx);
+                keys.push(a);
+                break idx;
+            }
+            s_a = (s_a + 1) & mask;
+        };
+        let mut s_b = home(b);
+        let id_b = loop {
+            let kk = slots[s_b][0];
+            if kk == b {
+                break slots[s_b][1] as u32;
+            }
+            if kk == PEMPTY {
+                let idx = keys.len() as u32;
+                slots[s_b] = [b, idx as u64];
+                parent.push(idx);
+                keys.push(b);
+                break idx;
+            }
+            s_b = (s_b + 1) & mask;
+        };
+        prefetch(parent.as_ptr().wrapping_add(id_a as usize));
+        prefetch(parent.as_ptr().wrapping_add(id_b as usize));
         // join the pair seen AHEAD pairs ago
         let j = i % AHEAD;
         if i >= AHEAD {
@@ -2441,7 +2455,7 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
                 parent[ra.max(rb) as usize] = ra.min(rb);
             }
         }
-        ring[j] = (ids[0], ids[1]);
+        ring[j] = (id_a, id_b);
     }
     for k in (npairs - npairs.min(AHEAD))..npairs {
         let (x, y) = ring[k % AHEAD];
@@ -2472,17 +2486,9 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
             best[r] = keys[i];
         }
     }
-    let mut nmap = 0;
-    for i in 0..n {
-        if i + AHEAD < n {
-            prefetch(best.as_ptr().wrapping_add(parent[i + AHEAD] as usize));
-        }
-        if best[parent[i] as usize] != keys[i] {
-            nmap += 1;
-        }
-    }
     let t_names = t0.elapsed();
-    let mut pm = PMap::new(nmap);
+    let mut pm = PMap::new(n);
+    let mut nmap = 0;
     for i in 0..n {
         if i + AHEAD < n {
             prefetch(best.as_ptr().wrapping_add(parent[i + AHEAD] as usize));
@@ -2491,6 +2497,7 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
         let b = best[parent[i] as usize];
         if b != keys[i] {
             pm.insert(keys[i], b);
+            nmap += 1;
         }
     }
     eprintln!(
@@ -3626,10 +3633,12 @@ fn main() {
                             };
                             let en = e.len();
                             let ep = e.as_ptr();
+                            let day_base = tb.div_euclid(DAY);
+                            let day_rem = (tb - day_base * DAY) as u64;
                             while k < en {
                                 let s0 = (unsafe { *ep.add(k) } >> 32) as u32;
                                 // close the previous day first: its category totals are reset there
-                                let day = (tb + s0 as i64).div_euclid(DAY);
+                                let day = day_base + ((s0 as u64 + day_rem) / 86_400_000) as i64;
                                 if day != cur_day {
                                     if cur_day != i64::MIN {
                                         let odi = (cur_day - day0) as usize;
