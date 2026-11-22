@@ -678,6 +678,26 @@ fn uhash(lo: u64, hi: u64, tag: u32) -> u64 {
     hash16(lo, hi ^ ((tag as u64) << 40))
 }
 impl PTab {
+    /// value already stored for `id`, or store `v` and return it
+    fn get_or_insert(&mut self, id: S, v: u32) -> u32 {
+        let (lo, hi, tag) = ukey(id);
+        if tag == 0 {
+            return *self.long.entry(id).or_insert(v);
+        }
+        let mut i = (uhash(lo, hi, tag) as usize) & self.mask;
+        loop {
+            let sl = unsafe { self.slots.get_unchecked_mut(i) };
+            if sl.len == 0 {
+                *sl = Slot { lo, hi, pid: v, len: tag };
+                return v;
+            }
+            if sl.len == tag && sl.lo == lo && sl.hi == hi {
+                return sl.pid;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[allow(dead_code)]
     fn insert(&mut self, id: S, pid: u32) {
         let (lo, hi, tag) = ukey(id);
         if tag == 0 {
@@ -969,9 +989,15 @@ fn main() {
             v
         })
         .collect();
-    let mut idx: Map<S, u32> = Map::default();
-    let mut names: Vec<S> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
+    // one table: id -> union-find node while merging, rewritten in place to id -> pid afterwards.
+    // at most 2 * pairs distinct ids, so cap >= 3 * pairs keeps it below 2/3 full
+    let mut cap = 1usize;
+    while cap < pairs.len() * 3 + 16 {
+        cap <<= 1;
+    }
+    let mut ptab = PTab { mask: cap - 1, slots: vec![Slot::default(); cap], long: Map::default() };
+    let mut names: Vec<S> = Vec::with_capacity(pairs.len() * 3 / 2 + 16);
+    let mut parent: Vec<u32> = Vec::with_capacity(pairs.len() * 3 / 2 + 16);
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         let mut r = x;
         while p[r as usize] != r {
@@ -985,16 +1011,18 @@ fn main() {
         r
     }
     for &(a, b) in &pairs {
-        let ia = *idx.entry(a).or_insert_with(|| {
+        let na = names.len() as u32;
+        let ia = ptab.get_or_insert(a, na);
+        if ia == na {
             names.push(a);
-            parent.push(names.len() as u32 - 1);
-            names.len() as u32 - 1
-        });
-        let ib = *idx.entry(b).or_insert_with(|| {
+            parent.push(na);
+        }
+        let nb = names.len() as u32;
+        let ib = ptab.get_or_insert(b, nb);
+        if ib == nb {
             names.push(b);
-            parent.push(names.len() as u32 - 1);
-            names.len() as u32 - 1
-        });
+            parent.push(nb);
+        }
         let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
         if ra != rb {
             if names[ra as usize] < names[rb as usize] {
@@ -1015,15 +1043,15 @@ fn main() {
     }
     let num_roots = root_names.len() as u32;
 
-    let mut cap = 1usize;
-    while cap < names.len() * 2 + 16 {
-        cap <<= 1;
+    // parent is fully flattened by the loop above: node -> pid directly
+    let node_pid: Vec<u32> = parent.iter().map(|&r| root_pid[r as usize]).collect();
+    for sl in ptab.slots.iter_mut() {
+        if sl.len != 0 {
+            sl.pid = node_pid[sl.pid as usize];
+        }
     }
-    let mut ptab = PTab { mask: cap - 1, slots: vec![Slot::default(); cap], long: Map::default() };
-    for i in 0..names.len() as u32 {
-        let r = find(&mut parent, i);
-        let pid = root_pid[r as usize];
-        ptab.insert(names[i as usize], pid);
+    for v in ptab.long.values_mut() {
+        *v = node_pid[*v as usize];
     }
     log(&t0, &format!("links: {} pairs, {} ids, {} roots", pairs.len(), names.len(), num_roots));
     let ptab = &ptab;
