@@ -2381,6 +2381,7 @@ unsafe fn cl_fast<S: ClickSink, const TAIL: bool>(cx: &Cx<CkBatch, S>, p: *const
 
 const PIPE: u8 = 0;
 const PFD: usize = 1024;
+const PFD_EV: usize = 4096;
 const CHAIN: u8 = 1;
 
 const TAG: usize = 1 << 63;
@@ -3761,7 +3762,7 @@ unsafe fn ev_loop<S: EventSink>(p: *const u8, w: *mut i64, b: *mut EvBatch, cx: 
             out("k0") _, out("k1") _, out("k2") _, out("k3") _, out("k4") _, out("k5") _, out("k6") _, out("k7") _,
             T = sym T, TJL = sym TJL, EVC = sym EVC, EJ = sym EJ, K3 = sym K3, TL2 = sym TL2, PUC = sym PUC, FL = sym flush_ev::<S>, REDO = sym ev_redo::<S>, FIX = sym ev_fix::<S>, LF = sym ev_lf::<S>,
             PROD = const E_PROD, EJE = const EJ_E, LXC = sym LXC, EJE7 = const EJ_E * 128, EHI = const E_EHI,
-            PP = const E_PP, EID = const E_EID, UID = const E_UID, ING = const E_ING, SCR = const E_SCR, NOFF = const E_N, PFD = const PFD,
+            PP = const E_PP, EID = const E_EID, UID = const E_UID, ING = const E_ING, SCR = const E_SCR, NOFF = const E_N, PFD = const PFD_EV,
         );
     }
     (code, np, nw)
