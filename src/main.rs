@@ -1654,11 +1654,18 @@ fn xp(bit: usize) -> bool {
     XP.load(Ordering::Relaxed) & bit != 0
 }
 
+/// Four-slot cache-line bucket for `PMap`: 4 keys (32B) + 4 values (32B) = 64B.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct PBucket {
+    k: [u64; 4],
+    v: [u64; 4],
+}
+
 /// user key -> person key, only for IDs whose person name differs from themselves.
 struct PMap {
-    slots: Vec<[u64; 2]>,
-    mask: usize,
-    shift: u32,
+    buckets: Vec<PBucket>,
+    nbuckets: usize,
 }
 
 /// Key of an empty `PMap` slot.
@@ -1667,6 +1674,7 @@ const PEMPTY: u64 = 0;
 /// The value of the slot whose key is k, or k itself if neither slot has it. On
 /// x86-64 this is written as two conditional moves: the compiler otherwise turns the
 /// choice into branches, and it is a coin flip per row.
+#[allow(dead_code)]
 #[inline(always)]
 fn pick2(k: u64, s0: [u64; 2], s1: [u64; 2]) -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -1702,58 +1710,88 @@ fn pick2(k: u64, s0: [u64; 2], s1: [u64; 2]) -> u64 {
 
 impl PMap {
     fn new(n: usize) -> Self {
-        // Buckets of two slots (one cache line), sparse on purpose (at most one key
-        // per four buckets): most lookups are of users that are not in the map, and a
-        // lookup only has to look further when its bucket is full, which is rare.
-        // An empty slot has key 0 (no ID has key 0), so the table starts as fresh
-        // zero pages and needs no initialization pass.
-        let mul: usize = std::env::var("PMUL").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let cap = (n * mul).next_power_of_two().max(16);
-        PMap { slots: vec![[PEMPTY, 0]; cap], mask: cap - 1, shift: 64 - cap.trailing_zeros() }
+        // 4-slot 64B cache-line buckets with Lemire fast-range (no power-of-2 cliff):
+        // at ~50% load (default PMUL=2 -> nbuckets = ceil(n/2)), 2.44M entries fit in
+        // ~78 MB (inside L3). Empty slots have key 0 (no ID has key 0), so fresh zero
+        // huge pages need no initialization pass.
+        let mul: usize = std::env::var("PMUL").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let nbuckets = ((n.saturating_mul(mul) + 3) / 4).max(4);
+        PMap {
+            buckets: vec![PBucket { k: [PEMPTY; 4], v: [0; 4] }; nbuckets],
+            nbuckets,
+        }
     }
     fn insert(&mut self, k: u64, v: u64) {
         let mut i = self.slot_of(k);
         loop {
-            for j in [i, i + 1] {
-                if self.slots[j][0] == PEMPTY || self.slots[j][0] == k {
-                    self.slots[j] = [k, v];
+            let b = &mut self.buckets[i];
+            for j in 0..4 {
+                if b.k[j] == PEMPTY || b.k[j] == k {
+                    b.k[j] = k;
+                    b.v[j] = v;
                     return;
                 }
             }
-            i = (i + 2) & self.mask;
+            i += 1;
+            if i == self.nbuckets {
+                i = 0;
+            }
         }
     }
-    /// First slot of k's bucket (an even index).
+    /// Bucket index of user key k via Lemire fast-range.
     #[inline(always)]
     fn slot_of(&self, k: u64) -> usize {
-        (k.wrapping_mul(GOLD) >> self.shift) as usize & !1
+        (((k.wrapping_mul(GOLD) as u128) * (self.nbuckets as u128)) >> 64) as usize
     }
     #[inline(always)]
     fn prefetch(&self, i: usize) {
-        prefetch(self.slots.as_ptr().wrapping_add(i));
+        prefetch(self.buckets.as_ptr().wrapping_add(i));
     }
     /// The person of user key k (k itself when it is not in the map); i = slot_of(k).
-    /// Which slot holds k, if any, is a coin flip per row, so that choice is made
-    /// without branches (`pick2`); only a full bucket without k takes a branch.
     #[inline(always)]
     fn lookup_from(&self, i: usize, k: u64) -> u64 {
-        let (s0, s1) = unsafe { (*self.slots.get_unchecked(i), *self.slots.get_unchecked(i + 1)) };
-        // a bucket fills its first slot first
-        if (s0[0] != k) & (s1[0] != k) & (s1[0] != PEMPTY) {
-            return self.lookup_far(i, k);
+        let b = unsafe { self.buckets.get_unchecked(i) };
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use core::arch::x86_64::*;
+            let keys = _mm256_load_si256(b.k.as_ptr() as *const __m256i);
+            let eq = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(k as i64));
+            let m = _mm256_movemask_pd(_mm256_castsi256_pd(eq)) as u32;
+            if (m == 0) & (b.k[3] != PEMPTY) {
+                return self.lookup_far(i, k);
+            }
+            let idx = (m.trailing_zeros() & 3) as usize;
+            let val = *b.v.get_unchecked(idx);
+            if m != 0 { val } else { k }
         }
-        pick2(k, s0, s1)
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            for j in 0..4 {
+                let kk = b.k[j];
+                if kk == k {
+                    return b.v[j];
+                }
+                if kk == PEMPTY {
+                    return k;
+                }
+            }
+            self.lookup_far(i, k)
+        }
     }
     #[inline(never)]
     fn lookup_far(&self, mut i: usize, k: u64) -> u64 {
         loop {
-            i = (i + 2) & self.mask;
-            for j in [i, i + 1] {
-                let s = self.slots[j];
-                if s[0] == k {
-                    return s[1];
+            i += 1;
+            if i == self.nbuckets {
+                i = 0;
+            }
+            let b = unsafe { self.buckets.get_unchecked(i) };
+            for j in 0..4 {
+                let kk = b.k[j];
+                if kk == k {
+                    return b.v[j];
                 }
-                if s[0] == PEMPTY {
+                if kk == PEMPTY {
                     return k;
                 }
             }
