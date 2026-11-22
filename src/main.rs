@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
@@ -142,6 +141,43 @@ fn populate_out_const<const NF: usize>(
     }
 }
 
+/// Finish a line whose commas were all collected: split on commas, then (only if the line holds
+/// quotes) strip outer quotes per field. A field may hold quotes only as its first and last byte
+/// (len >= 2); that holds iff every quote-led field also ends in a quote and the line's quote
+/// count equals twice the number of such fields.
+#[inline(always)]
+fn finish_line<const NF: usize>(
+    data: S,
+    line_start: usize,
+    commas: &[u32; 16],
+    ncommas: usize,
+    nq: u32,
+    line_end: usize,
+    out: &mut [Option<S>],
+) -> bool {
+    if ncommas + 1 != NF {
+        return false;
+    }
+    populate_out_const::<NF>(data, line_start, commas, line_end, out);
+    if nq == 0 {
+        return true;
+    }
+    let mut qf = 0u32;
+    for k in 0..NF {
+        if let Some(f) = out[k] {
+            if f[0] == b'"' {
+                let n = f.len();
+                if n < 2 || f[n - 1] != b'"' {
+                    return false;
+                }
+                qf += 1;
+                out[k] = if n == 2 { None } else { Some(&f[1..n - 1]) };
+            }
+        }
+    }
+    nq == 2 * qf
+}
+
 /// AVX-512 structural scan: 64-byte blocks, masks for \n, ',', '"'.
 /// Lines without quotes populate `out` directly from comma mask positions.
 /// Lines with quotes take the exact slow path `split_scalar`.
@@ -165,7 +201,7 @@ unsafe fn simd_for_lines<const NF: usize>(
     let mut line_start: usize = 0;
     let mut skipping = skip_header;
 
-    let mut has_quotes = false;
+    let mut nq: u32 = 0;
     let mut commas = [0u32; 16];
     let mut ncommas: usize = 0;
 
@@ -178,10 +214,8 @@ unsafe fn simd_for_lines<const NF: usize>(
         let qt_mask = _mm512_cmpeq_epi8_mask(chunk, qt_v);
 
         if nl_mask == 0 {
-            if qt_mask != 0 {
-                has_quotes = true;
-            }
-            if !skipping && !has_quotes {
+            nq += qt_mask.count_ones();
+            if !skipping {
                 let mut m = cm_mask;
                 while m != 0 {
                     let bit = m.trailing_zeros();
@@ -208,37 +242,28 @@ unsafe fn simd_for_lines<const NF: usize>(
             let seg_cm = cur_cm & before_nl;
             let seg_qt = cur_qt & before_nl;
 
-            if seg_qt != 0 {
-                has_quotes = true;
-            }
+            nq += seg_qt.count_ones();
 
             if skipping {
                 skipping = false;
             } else {
                 let line = &data[line_start..nl_pos];
-                if has_quotes {
-                    if split_scalar(line, out) {
-                        handler(line, out, true);
+                let mut m = seg_cm;
+                while m != 0 {
+                    let bit = m.trailing_zeros();
+                    if ncommas < 16 {
+                        commas[ncommas] = (pos + bit as usize) as u32;
                     }
-                } else {
-                    let mut m = seg_cm;
-                    while m != 0 {
-                        let bit = m.trailing_zeros();
-                        if ncommas < 16 {
-                            commas[ncommas] = (pos + bit as usize) as u32;
-                        }
-                        ncommas += 1;
-                        m &= m - 1;
-                    }
-                    if ncommas + 1 == NF {
-                        populate_out_const::<NF>(data, line_start, &commas, nl_pos, out);
-                        handler(line, out, false);
-                    }
+                    ncommas += 1;
+                    m &= m - 1;
+                }
+                if finish_line::<NF>(data, line_start, &commas, ncommas, nq, nl_pos, out) {
+                    handler(line, out, nq != 0);
                 }
             }
 
             line_start = nl_pos + 1;
-            has_quotes = false;
+            nq = 0;
             ncommas = 0;
 
             let clear_mask = if nl_bit < 63 { !((1u64 << (nl_bit + 1)) - 1) } else { 0 };
@@ -247,10 +272,8 @@ unsafe fn simd_for_lines<const NF: usize>(
             cur_nl &= cur_nl - 1;
         }
 
-        if cur_qt != 0 {
-            has_quotes = true;
-        }
-        if !skipping && !has_quotes {
+        nq += cur_qt.count_ones();
+        if !skipping {
             let mut m = cur_cm;
             while m != 0 {
                 let bit = m.trailing_zeros();
@@ -273,21 +296,16 @@ unsafe fn simd_for_lines<const NF: usize>(
                 skipping = false;
             } else {
                 let line = &data[line_start..pos];
-                if has_quotes {
-                    if split_scalar(line, out) {
-                        handler(line, out, true);
-                    }
-                } else if ncommas + 1 == NF {
-                    populate_out_const::<NF>(data, line_start, &commas, pos, out);
-                    handler(line, out, false);
+                if finish_line::<NF>(data, line_start, &commas, ncommas, nq, pos, out) {
+                    handler(line, out, nq != 0);
                 }
             }
             line_start = pos + 1;
-            has_quotes = false;
+            nq = 0;
             ncommas = 0;
         } else if c == b'"' {
-            has_quotes = true;
-        } else if c == b',' && !skipping && !has_quotes {
+            nq += 1;
+        } else if c == b',' && !skipping {
             if ncommas < 16 {
                 commas[ncommas] = pos as u32;
             }
@@ -298,13 +316,8 @@ unsafe fn simd_for_lines<const NF: usize>(
 
     if line_start < len && !skipping {
         let line = &data[line_start..];
-        if has_quotes {
-            if split_scalar(line, out) {
-                handler(line, out, true);
-            }
-        } else if ncommas + 1 == NF {
-            populate_out_const::<NF>(data, line_start, &commas, len, out);
-            handler(line, out, false);
+        if finish_line::<NF>(data, line_start, &commas, ncommas, nq, len, out) {
+            handler(line, out, nq != 0);
         }
     }
 }
@@ -540,6 +553,116 @@ fn parse_ts(s: S) -> Option<i64> {
             v = v * 10 + (c - b'0') as u64;
         }
         if v > i64::MAX as u64 { None } else { Some(v as i64) }
+    }
+}
+
+/// Per-thread cache of the last valid `YYYY-MM-DD` prefix (10 bytes) -> days since epoch.
+struct DateCache {
+    p8: u64,
+    p2: u16,
+    days: i64,
+}
+impl DateCache {
+    fn new() -> Self {
+        DateCache { p8: 0, p2: 0, days: 0 }
+    }
+}
+
+/// Same result as `parse_ts`, but the ISO date part is looked up in `c` (all ts in a chunk share few dates).
+#[inline(always)]
+fn parse_ts_c(s: S, c: &mut DateCache) -> Option<i64> {
+    let n = s.len();
+    if !((n == 20 || n == 25) && s[4] == b'-') {
+        return parse_ts(s);
+    }
+    let p8 = u64::from_le_bytes(s[..8].try_into().unwrap());
+    let p2 = u16::from_le_bytes(s[8..10].try_into().unwrap());
+    let days = if p8 == c.p8 && p2 == c.p2 {
+        c.days
+    } else {
+        if s[7] != b'-' {
+            return None;
+        }
+        let dg = |i: usize| s[i].wrapping_sub(b'0');
+        let ds = [dg(0), dg(1), dg(2), dg(3), dg(5), dg(6), dg(8), dg(9)];
+        if ds.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
+            return None;
+        }
+        let v = |k: usize| ds[k] as i64;
+        let y = v(0) * 1000 + v(1) * 100 + v(2) * 10 + v(3);
+        let (mo, d) = (v(4) * 10 + v(5), v(6) * 10 + v(7));
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let dim = match mo {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            1..=12 => 31,
+            _ => return None,
+        };
+        if d < 1 || d > dim {
+            return None;
+        }
+        let days = if (DB_Y0..DB_Y0 + DB_N).contains(&y) {
+            DB[((y - DB_Y0) * 12 + mo - 1) as usize] as i64 + d - 1
+        } else {
+            days_from_civil(y, mo, d)
+        };
+        c.p8 = p8;
+        c.p2 = p2;
+        c.days = days;
+        days
+    };
+    if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+        return None;
+    }
+    let dg = |i: usize| s[i].wrapping_sub(b'0');
+    let ts = [dg(11), dg(12), dg(14), dg(15), dg(17), dg(18)];
+    if ts.iter().fold(0u8, |m, &d| m | (d > 9) as u8) != 0 {
+        return None;
+    }
+    let v = |k: usize| ts[k] as i64;
+    let (h, mi, se) = (v(0) * 10 + v(1), v(2) * 10 + v(3), v(4) * 10 + v(5));
+    if h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let off = if n == 20 {
+        if s[19] != b'Z' {
+            return None;
+        }
+        0
+    } else {
+        let sg = match s[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if s[22] != b':' {
+            return None;
+        }
+        let (oh, om) = (d2(s, 20)?, d2(s, 23)?);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sg * (oh * 3_600_000 + om * 60_000)
+    };
+    Some(days * DAY + h * 3_600_000 + mi * 60_000 + se * 1000 - off)
+}
+
+/// event_type -> 1 view, 2 cart, 3 purchase, 0 other (exact, case-sensitive)
+#[inline(always)]
+fn event_type(e: S) -> u32 {
+    match e.len() {
+        4 => {
+            let w = u32::from_le_bytes(e[..4].try_into().unwrap());
+            if w == u32::from_le_bytes(*b"view") {
+                1
+            } else if w == u32::from_le_bytes(*b"cart") {
+                2
+            } else {
+                0
+            }
+        }
+        8 => (u64::from_le_bytes(e[..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase")) as u32 * 3,
+        _ => 0,
     }
 }
 
@@ -857,9 +980,6 @@ fn manifest_field(txt: &str, key: &str) -> String {
     rest[a..b].to_string()
 }
 
-fn utf8(s: &[u8]) -> std::borrow::Cow<'_, str> {
-    String::from_utf8_lossy(s)
-}
 
 fn main() {
     let t0 = Instant::now();
@@ -909,6 +1029,10 @@ fn main() {
     }
     let ncamp = camp_names.len();
 
+    // map event/click files first; fault their pages in on the other threads while links build serially
+    let echunks = chunks(&data.join("events"));
+    let cchunks = chunks(&data.join("clicks"));
+    let ((ptab, root_names, num_roots), _) = rayon::join(|| {
     // links -> union-find; root = byte-wise smallest id
     let lchunks = chunks(&data.join("links"));
     let pairs: Vec<(S, S)> = lchunks
@@ -983,10 +1107,20 @@ fn main() {
         ptab.insert(names[i as usize], pid);
     }
     log(&t0, &format!("links: {} pairs, {} ids, {} roots", pairs.len(), names.len(), num_roots));
+    (ptab, root_names, num_roots)
+    }, || {
+        let sum: u64 = echunks.par_iter().chain(cchunks.par_iter()).map(|&(d, _)| {
+            let mut acc = 0u64;
+            let mut i = 0;
+            while i < d.len() {
+                acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(d.as_ptr().add(i)) } as u64);
+                i += 4096;
+            }
+            acc
+        }).sum();
+        std::hint::black_box(sum);
+    });
     let ptab = &ptab;
-
-    let echunks = chunks(&data.join("events"));
-    let cchunks = chunks(&data.join("clicks"));
     let total_input_bytes: usize = echunks.iter().map(|c| c.0.len()).sum::<usize>()
         + cchunks.iter().map(|c| c.0.len()).sum::<usize>();
     let icap = if total_input_bytes < 10 << 20 {
@@ -1047,6 +1181,7 @@ fn main() {
                     let mut f = [None; 7];
                     let mut batch = [DUMMY_EVENT; EVENT_BATCH];
                     let mut batch_len = 0;
+                    let mut dc = DateCache::new();
 
                     let mut flush_events = |batch: &[EventBatchItem; EVENT_BATCH], len: usize, payload: &mut Vec<EventPayload>, out: &mut Vec<Vec<EvKey>>| {
                         if len == 0 { return; }
@@ -1085,7 +1220,7 @@ fn main() {
                         if let Some(id) = f[0] {
                             if id.is_empty() { return; }
                             let h = xxh3_64(id);
-                            let ingest = f[3].and_then(parse_ts).unwrap_or(i64::MAX);
+                            let ingest = match f[3] { Some(x) => parse_ts_c(x, &mut dc).unwrap_or(i64::MAX), None => i64::MAX };
 
                             let mut valid = false;
                             let mut user: S = &[];
@@ -1098,17 +1233,9 @@ fn main() {
 
                             if let (Some(u), Some(t_str), Some(e_str), Some(prod)) = (f[1], f[2], f[4], f[5]) {
                                 if !u.is_empty() && !prod.is_empty() {
-                                    if let Some(t) = parse_ts(t_str) {
+                                    if let Some(t) = parse_ts_c(t_str, &mut dc) {
                                         if t >= ws && t < we && ingest - t <= DAY {
-                                            let et = if eqs(e_str, b"view") {
-                                                1
-                                            } else if eqs(e_str, b"cart") {
-                                                2
-                                            } else if eqs(e_str, b"purchase") {
-                                                3
-                                            } else {
-                                                0
-                                            };
+                                            let et = event_type(e_str);
                                             if et != 0 {
                                                 let pr = if et == 3 { parse_price(f[6]) } else { 0 };
                                                 if et != 3 || pr >= 1 {
@@ -1310,6 +1437,7 @@ fn main() {
                     let mut f = [None; 4];
                     let mut batch = [DUMMY_CLICK; CLICK_BATCH];
                     let mut batch_len = 0;
+                    let mut dc = DateCache::new();
 
                     let mut flush_clicks = |batch: &[ClickBatchItem; CLICK_BATCH], len: usize, cnt: &mut [u32; NB2], surv: &mut Vec<CkRec>| {
                         if len == 0 { return; }
@@ -1352,7 +1480,7 @@ fn main() {
 
                             if let (Some(u), Some(c), Some(t_str)) = (f[1], f[2], f[3]) {
                                 if !u.is_empty() {
-                                    if let Some(t) = parse_ts(t_str) {
+                                    if let Some(t) = parse_ts_c(t_str, &mut dc) {
                                         if t >= ws - WEEK && t < we {
                                             if let Some(&cmp) = camp_id.get(c) {
                                                 user = u;
@@ -1656,7 +1784,241 @@ fn main() {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    std::process::exit(0);
+    // skip destructors and the munmap of every input mapping / big table
+    extern "C" {
+        fn _exit(code: i32) -> !;
+    }
+    unsafe { _exit(0) }
+}
+
+// ---------------- minimal uncompressed Parquet writer (PLAIN pages, Thrift compact footer) ----------------
+mod pq {
+    pub enum Col<'a> {
+        /// required BYTE_ARRAY (UTF8)
+        Str(Vec<&'a [u8]>),
+        /// optional BYTE_ARRAY (UTF8); None = NULL
+        OptStr(Vec<Option<&'a [u8]>>),
+        /// required INT32 DATE
+        Date(Vec<i32>),
+        /// required INT64
+        I64(Vec<i64>),
+    }
+
+    struct W(Vec<u8>);
+    impl W {
+        fn uv(&mut self, mut v: u64) {
+            while v >= 0x80 {
+                self.0.push((v as u8) | 0x80);
+                v >>= 7;
+            }
+            self.0.push(v as u8);
+        }
+        fn zz(&mut self, v: i64) {
+            self.uv(((v << 1) ^ (v >> 63)) as u64);
+        }
+        /// field header (compact protocol); `last` tracks the previous field id in the struct
+        fn fh(&mut self, last: &mut i16, id: i16, ty: u8) {
+            let d = id - *last;
+            if d > 0 && d <= 15 {
+                self.0.push(((d as u8) << 4) | ty);
+            } else {
+                self.0.push(ty);
+                self.zz(id as i64);
+            }
+            *last = id;
+        }
+        fn i32f(&mut self, last: &mut i16, id: i16, v: i32) {
+            self.fh(last, id, 5);
+            self.zz(v as i64);
+        }
+        fn i64f(&mut self, last: &mut i16, id: i16, v: i64) {
+            self.fh(last, id, 6);
+            self.zz(v);
+        }
+        fn binf(&mut self, last: &mut i16, id: i16, b: &[u8]) {
+            self.fh(last, id, 8);
+            self.uv(b.len() as u64);
+            self.0.extend_from_slice(b);
+        }
+        fn lh(&mut self, n: usize, ety: u8) {
+            if n < 15 {
+                self.0.push(((n as u8) << 4) | ety);
+            } else {
+                self.0.push(0xF0 | ety);
+                self.uv(n as u64);
+            }
+        }
+        fn stop(&mut self) {
+            self.0.push(0);
+        }
+    }
+
+    const T_INT32: i32 = 1;
+    const T_INT64: i32 = 2;
+    const T_BYTE_ARRAY: i32 = 6;
+
+    fn put_str(body: &mut Vec<u8>, s: &[u8]) {
+        body.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        body.extend_from_slice(s);
+    }
+
+    /// Write one file with a single row group; one PLAIN data page (v1) per column.
+    pub fn write_file(path: &std::path::Path, names: &[&str], cols: &[Col]) -> std::io::Result<()> {
+        let nrows = match &cols[0] {
+            Col::Str(v) => v.len(),
+            Col::OptStr(v) => v.len(),
+            Col::Date(v) => v.len(),
+            Col::I64(v) => v.len(),
+        };
+        let mut f: Vec<u8> = Vec::with_capacity(1 << 16);
+        f.extend_from_slice(b"PAR1");
+        // per column: (physical type, chunk offset, chunk size)
+        let mut meta: Vec<(i32, i64, i64)> = Vec::with_capacity(cols.len());
+        for col in cols {
+            let mut body: Vec<u8> = Vec::new();
+            let ty = match col {
+                Col::Str(v) => {
+                    body.reserve(v.iter().map(|s| s.len() + 4).sum());
+                    for s in v {
+                        put_str(&mut body, s);
+                    }
+                    T_BYTE_ARRAY
+                }
+                Col::OptStr(v) => {
+                    // definition levels: RLE/bit-packed hybrid, bit width 1, a single bit-packed run, 4-byte length prefix
+                    let groups = v.len().div_ceil(8);
+                    let mut lv = W(Vec::with_capacity(groups + 10));
+                    lv.uv(((groups as u64) << 1) | 1);
+                    let mut bits = vec![0u8; groups];
+                    for (i, x) in v.iter().enumerate() {
+                        if x.is_some() {
+                            bits[i >> 3] |= 1 << (i & 7);
+                        }
+                    }
+                    lv.0.extend_from_slice(&bits);
+                    body.extend_from_slice(&(lv.0.len() as u32).to_le_bytes());
+                    body.extend_from_slice(&lv.0);
+                    for s in v.iter().flatten() {
+                        put_str(&mut body, s);
+                    }
+                    T_BYTE_ARRAY
+                }
+                Col::Date(v) => {
+                    body.reserve(v.len() * 4);
+                    for x in v {
+                        body.extend_from_slice(&x.to_le_bytes());
+                    }
+                    T_INT32
+                }
+                Col::I64(v) => {
+                    body.reserve(v.len() * 8);
+                    for x in v {
+                        body.extend_from_slice(&x.to_le_bytes());
+                    }
+                    T_INT64
+                }
+            };
+            // PageHeader
+            let mut h = W(Vec::with_capacity(32));
+            let mut l = 0i16;
+            h.i32f(&mut l, 1, 0); // DATA_PAGE
+            h.i32f(&mut l, 2, body.len() as i32);
+            h.i32f(&mut l, 3, body.len() as i32);
+            h.fh(&mut l, 5, 12); // DataPageHeader
+            {
+                let mut l2 = 0i16;
+                h.i32f(&mut l2, 1, nrows as i32);
+                h.i32f(&mut l2, 2, 0); // PLAIN
+                h.i32f(&mut l2, 3, 3); // RLE
+                h.i32f(&mut l2, 4, 3); // RLE
+                h.stop();
+            }
+            h.stop();
+            let off = f.len() as i64;
+            f.extend_from_slice(&h.0);
+            f.extend_from_slice(&body);
+            meta.push((ty, off, (h.0.len() + body.len()) as i64));
+        }
+        // FileMetaData
+        let mut m = W(Vec::with_capacity(1024));
+        let mut l = 0i16;
+        m.i32f(&mut l, 1, 1); // version
+        m.fh(&mut l, 2, 9); // schema
+        m.lh(cols.len() + 1, 12);
+        {
+            let mut l2 = 0i16;
+            m.binf(&mut l2, 4, b"schema");
+            m.i32f(&mut l2, 5, cols.len() as i32);
+            m.stop();
+        }
+        for (k, col) in cols.iter().enumerate() {
+            let mut l2 = 0i16;
+            // (physical type, repetition, converted type or -1, logical type union field or 0)
+            let (ty, rep, conv, logical) = match col {
+                Col::Str(_) => (T_BYTE_ARRAY, 0, 0, 1),
+                Col::OptStr(_) => (T_BYTE_ARRAY, 1, 0, 1),
+                Col::Date(_) => (T_INT32, 0, 6, 6),
+                Col::I64(_) => (T_INT64, 0, -1, 0),
+            };
+            m.i32f(&mut l2, 1, ty);
+            m.i32f(&mut l2, 3, rep);
+            m.binf(&mut l2, 4, names[k].as_bytes());
+            if conv >= 0 {
+                m.i32f(&mut l2, 6, conv);
+            }
+            if logical > 0 {
+                m.fh(&mut l2, 10, 12); // LogicalType union
+                let mut l3 = 0i16;
+                m.fh(&mut l3, logical as i16, 12); // STRING(1) / DATE(6): empty struct
+                m.stop();
+                m.stop();
+            }
+            m.stop();
+        }
+        m.i64f(&mut l, 3, nrows as i64);
+        m.fh(&mut l, 4, 9); // row_groups
+        m.lh(1, 12);
+        {
+            let mut l2 = 0i16;
+            m.fh(&mut l2, 1, 9); // columns
+            m.lh(cols.len(), 12);
+            let mut total = 0i64;
+            for (k, &(ty, off, sz)) in meta.iter().enumerate() {
+                total += sz;
+                let mut l3 = 0i16;
+                m.i64f(&mut l3, 2, off); // file_offset
+                m.fh(&mut l3, 3, 12); // ColumnMetaData
+                {
+                    let mut l4 = 0i16;
+                    m.i32f(&mut l4, 1, ty);
+                    m.fh(&mut l4, 2, 9); // encodings
+                    m.lh(2, 5);
+                    m.zz(0); // PLAIN
+                    m.zz(3); // RLE
+                    m.fh(&mut l4, 3, 9); // path_in_schema
+                    m.lh(1, 8);
+                    m.uv(names[k].len() as u64);
+                    m.0.extend_from_slice(names[k].as_bytes());
+                    m.i32f(&mut l4, 4, 0); // UNCOMPRESSED
+                    m.i64f(&mut l4, 5, nrows as i64);
+                    m.i64f(&mut l4, 6, sz);
+                    m.i64f(&mut l4, 7, sz);
+                    m.i64f(&mut l4, 9, off); // data_page_offset
+                    m.stop();
+                }
+                m.stop();
+            }
+            m.i64f(&mut l2, 2, total);
+            m.i64f(&mut l2, 3, nrows as i64);
+            m.stop();
+        }
+        m.binf(&mut l, 6, b"gmunvis own5b");
+        m.stop();
+        f.extend_from_slice(&m.0);
+        f.extend_from_slice(&(m.0.len() as u32).to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        std::fs::write(path, &f)
+    }
 }
 
 fn write_outputs(
@@ -1669,77 +2031,54 @@ fn write_outputs(
     cat_names: &[S],
     camp_names: &[(S, S)],
 ) {
-    use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-    use parquet::basic::Compression;
-    use parquet::file::properties::WriterProperties;
-    let props = || WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).build();
-
+    use pq::Col;
+    // invalid UTF-8 is written in its lossy UTF-8 form (as the earlier arrow path did)
+    fn u8b(s: &[u8]) -> &[u8] {
+        if std::str::from_utf8(s).is_ok() {
+            s
+        } else {
+            Box::leak(String::from_utf8_lossy(s).into_owned().into_bytes().into_boxed_slice())
+        }
+    }
     let udir = out.join("user_daily");
     let cdir = out.join("campaign_daily");
     fs::create_dir_all(&udir).unwrap();
     fs::create_dir_all(&cdir).unwrap();
+    let cat_b: Vec<&[u8]> = cat_names.iter().map(|c| u8b(c)).collect();
 
     let write_ud = || {
-        let us = Arc::new(Schema::new(vec![
-            Field::new("user_id", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("events", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("top_category", DataType::Utf8, true),
-        ]));
+        let names = ["user_id", "day", "sessions", "events", "revenue_cents", "top_category"];
         let parts = 8usize;
         let per = ud.len().div_ceil(parts).max(1);
         let pieces: Vec<&[(S, i32, i64, i64, i64, u32)]> = if ud.is_empty() { vec![ud] } else { ud.chunks(per).collect() };
         pieces.par_iter().enumerate().for_each(|(pi, rows)| {
-            let cols: Vec<ArrayRef> = vec![
-                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| utf8(r.0)))),
-                Arc::new(Date32Array::from_iter_values(rows.iter().map(|r| r.1))),
-                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
-                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
-                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.4))),
-                Arc::new(StringArray::from_iter(
-                    rows.iter().map(|r| if r.5 == u32::MAX { None } else { Some(utf8(cat_names[r.5 as usize])) }),
-                )),
+            let cols = [
+                Col::Str(rows.iter().map(|r| u8b(r.0)).collect()),
+                Col::Date(rows.iter().map(|r| r.1).collect()),
+                Col::I64(rows.iter().map(|r| r.2).collect()),
+                Col::I64(rows.iter().map(|r| r.3).collect()),
+                Col::I64(rows.iter().map(|r| r.4).collect()),
+                Col::OptStr(rows.iter().map(|r| if r.5 == u32::MAX { None } else { Some(cat_b[r.5 as usize]) }).collect()),
             ];
-            let b = RecordBatch::try_new(us.clone(), cols).unwrap();
-            let f = File::create(udir.join(format!("part-{pi}.parquet"))).unwrap();
-            let mut w = ArrowWriter::try_new(f, us.clone(), Some(props())).unwrap();
-            w.write(&b).unwrap();
-            w.close().unwrap();
+            pq::write_file(&udir.join(format!("part-{pi}.parquet")), &names, &cols).unwrap();
         });
     };
 
     let write_cd = || {
-        let cs = Arc::new(Schema::new(vec![
-            Field::new("campaign_id", DataType::Utf8, false),
-            Field::new("channel", DataType::Utf8, false),
-            Field::new("day", DataType::Date32, false),
-            Field::new("sessions", DataType::Int64, false),
-            Field::new("purchasing_sessions", DataType::Int64, false),
-            Field::new("revenue_cents", DataType::Int64, false),
-            Field::new("assisted_sessions", DataType::Int64, false),
-        ]));
-
-        let mut camp_col: Vec<std::borrow::Cow<str>> = Vec::new();
-        let mut chan_col: Vec<std::borrow::Cow<str>> = Vec::new();
+        let names = ["campaign_id", "channel", "day", "sessions", "purchasing_sessions", "revenue_cents", "assisted_sessions"];
+        let mut camp_col: Vec<&[u8]> = Vec::new();
+        let mut chan_col: Vec<&[u8]> = Vec::new();
         let mut day_col: Vec<i32> = Vec::new();
-        let mut s0: Vec<i64> = Vec::new();
-        let mut s1: Vec<i64> = Vec::new();
-        let mut s2: Vec<i64> = Vec::new();
-        let mut s3: Vec<i64> = Vec::new();
-
+        let (mut s0, mut s1, mut s2, mut s3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for c in 0..=ncamp {
             for d in 0..ndays {
                 let r = cd[c * ndays + d];
                 if r[0] > 0 || r[3] > 0 {
-                    let (cid, ch) = if c == ncamp {
-                        (std::borrow::Cow::Borrowed("organic"), std::borrow::Cow::Borrowed("organic"))
+                    let (cid, ch): (&[u8], &[u8]) = if c == ncamp {
+                        (b"organic", b"organic")
                     } else {
                         let (a, b) = camp_names[c];
-                        (utf8(a), utf8(b))
+                        (u8b(a), u8b(b))
                     };
                     camp_col.push(cid);
                     chan_col.push(ch);
@@ -1751,21 +2090,8 @@ fn write_outputs(
                 }
             }
         }
-
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from_iter_values(camp_col)),
-            Arc::new(StringArray::from_iter_values(chan_col)),
-            Arc::new(Date32Array::from_iter_values(day_col)),
-            Arc::new(Int64Array::from_iter_values(s0)),
-            Arc::new(Int64Array::from_iter_values(s1)),
-            Arc::new(Int64Array::from_iter_values(s2)),
-            Arc::new(Int64Array::from_iter_values(s3)),
-        ];
-        let b = RecordBatch::try_new(cs.clone(), cols).unwrap();
-        let f = File::create(cdir.join("part-0.parquet")).unwrap();
-        let mut w = ArrowWriter::try_new(f, cs.clone(), Some(props())).unwrap();
-        w.write(&b).unwrap();
-        w.close().unwrap();
+        let cols = [Col::Str(camp_col), Col::Str(chan_col), Col::Date(day_col), Col::I64(s0), Col::I64(s1), Col::I64(s2), Col::I64(s3)];
+        pq::write_file(&cdir.join("part-0.parquet"), &names, &cols).unwrap();
     };
 
     rayon::join(write_ud, write_cd);
