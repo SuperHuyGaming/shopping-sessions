@@ -38,24 +38,24 @@ pub fn ncpu_env() -> usize {
 }
 
 pub fn run_generic(data: &str, out: &str, ncpu: usize) -> ! {
-    eprintln!("[generic] executing /shopping-sessions fallback");
+    eprintln!("[generic] executing in-process fallback");
     let ud = std::path::Path::new(out).join("user_daily");
     let cd = std::path::Path::new(out).join("campaign_daily");
     let _ = std::fs::remove_dir_all(&ud);
     let _ = std::fs::remove_dir_all(&cd);
-    let status = std::process::Command::new("/shopping-sessions")
-        .arg(data)
-        .arg(out)
-        .status();
-    match status {
-        Ok(s) if s.success() => unsafe { sys::_exit(0) },
-        Ok(s) => unsafe { sys::_exit(s.code().unwrap_or(1)) },
+    match generic::run(std::path::Path::new(data), std::path::Path::new(out), ncpu) {
+        Ok(()) => unsafe { sys::_exit(0) },
         Err(e) => {
-            eprintln!("[generic] failed to spawn /shopping-sessions: {e}, using internal generic");
-            match generic::run(std::path::Path::new(data), std::path::Path::new(out), ncpu) {
-                Ok(()) => unsafe { sys::_exit(0) },
-                Err(e) => {
-                    eprintln!("[generic] error: {e}");
+            eprintln!("[generic] in-process fallback error: {e}, falling back to /shopping-sessions");
+            let status = std::process::Command::new("/shopping-sessions")
+                .arg(data)
+                .arg(out)
+                .status();
+            match status {
+                Ok(s) if s.success() => unsafe { sys::_exit(0) },
+                Ok(s) => unsafe { sys::_exit(s.code().unwrap_or(1)) },
+                Err(e2) => {
+                    eprintln!("[generic] failed to spawn /shopping-sessions: {e2}");
                     unsafe { sys::_exit(1) }
                 }
             }
@@ -374,7 +374,7 @@ fn main() {
     let knob = |name: &str, default: bool| std::env::var(name).map_or(default, |v| v == "1");
     unsafe {
         parse::NT = knob("XL_NT", true);
-        parse::RELEASE = knob("XL_REL", true);
+        parse::RELEASE = knob("XL_REL", false);
         parse::PREFETCH = knob("XL_PF", false);
         sys::RELEASE.store(knob("XL_FREE", true), std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "knobs")]
@@ -469,8 +469,7 @@ fn main() {
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
-    let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
-    if ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2") {
+    if endrel.as_deref() == Some("1") || endrel.as_deref() == Some("2") {
         let nt = g.nt;
         let mut r = [[(0usize, 0usize); 12]; 16];
         for tid in 0..nt {

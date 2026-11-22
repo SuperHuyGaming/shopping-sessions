@@ -2,6 +2,7 @@ use crate::keyrec;
 use crate::k_ref;
 use crate::sys::*;
 use crate::*;
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,31 +255,39 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     if total as u64 >= (1u64 << 40) {
         fallback("input too large");
     }
-    let region = unsafe { mmap(std::ptr::null_mut(), total + hpg, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
+    let region = unsafe { mmap(std::ptr::null_mut(), total + hpg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) };
     if region as isize == -1 {
         fallback("mmap region");
     }
     let region = ((region as usize + hpg - 1) & !(hpg - 1)) as *mut u8;
+    unsafe { madvise(region, total, MADV_HUGEPAGE); }
     let mut files = Vec::with_capacity(all.len());
     let mut off = hpg;
     let (mut ev_bytes, mut ck_bytes, mut lk_bytes) = (0usize, 0usize, 0usize);
-    for (kind, p, len) in &all {
-        let Ok(f) = std::fs::File::open(p) else { fallback("open input") };
-        let q = unsafe { mmap(region.add(off), *len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f.as_raw_fd(), 0) };
-        if q as isize == -1 {
-            fallback("mmap input");
-        }
+    for (kind, _, len) in &all {
         match kind {
             Kind::Ev => ev_bytes += len,
             Kind::Ck => ck_bytes += len,
             Kind::Lk => lk_bytes += len,
         }
         files.push(FileInfo { kind: *kind, off, len: *len, hdr: usize::MAX });
-        unsafe { crate::parse::keep_fd(f) };
         off += (len + pg + hpg - 1) & !(hpg - 1);
     }
-    io_advise(region, off);
-    crate::parse::fault_around_check(region, &files);
+    let region_addr = region as usize;
+    let all_files = &all;
+    let files_info = &files;
+    sys::run_par(nt, |tid| {
+        let reg = region_addr as *mut u8;
+        for i in (tid..all_files.len()).step_by(nt) {
+            let (_, ref path, len) = all_files[i];
+            let file_off = files_info[i].off;
+            let Ok(mut f) = std::fs::File::open(path) else { fallback("open input") };
+            let dst = unsafe { std::slice::from_raw_parts_mut(reg.add(file_off), len) };
+            if f.read_exact(dst).is_err() {
+                fallback("read input");
+            }
+        }
+    });
     lap("s.mmap");
     let total_bytes = ev_bytes + ck_bytes + lk_bytes;
     let ch = (total_bytes / (nt * 16)).clamp(64 << 10, 2 << 20);
@@ -293,10 +302,13 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     }
 
     let mut sample = keyrec::Sample::default();
-    for f in files.iter().filter(|f| f.kind == Kind::Ev) {
+    let ev_files: Vec<_> = files.iter().filter(|f| f.kind == Kind::Ev).collect();
+    let per_file = if ev_files.len() > 1 { (5000 / ev_files.len().min(4)).max(1250) } else { 5000 };
+    for (idx, f) in ev_files.iter().enumerate() {
         if sample.events.len() >= 5000 {
             break;
         }
+        let target = ((idx + 1) * per_file).min(5000);
         let all = unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) };
         let hdr = all.iter().position(|&b| b == b'\n').map_or(f.len, |i| i + 1);
         let bytes = &all[hdr..];
@@ -306,7 +318,17 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
                 cut -= 1;
             }
         }
-        sample.add_event_lines(&bytes[..cut], 5000);
+        sample.add_event_lines(&bytes[..cut], target);
+    }
+    if sample.events.len() < 5000 {
+        for f in &ev_files {
+            if sample.events.len() >= 5000 {
+                break;
+            }
+            let all = unsafe { std::slice::from_raw_parts(region.add(f.off), f.len) };
+            let hdr = all.iter().position(|&b| b == b'\n').map_or(f.len, |i| i + 1);
+            sample.add_event_lines(&all[hdr..], 5000);
+        }
     }
     lap("s.sample");
     let mut st = keyrec::Stats::default();

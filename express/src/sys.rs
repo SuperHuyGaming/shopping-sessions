@@ -125,11 +125,13 @@ pub fn fallback(why: &str) -> ! {
             let _ = std::fs::remove_dir_all(&ud);
             let _ = std::fs::remove_dir_all(&cd);
 
-            execve(c"/shopping-sessions".as_ptr(), e.ptrs.as_ptr(), environ);
-            execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
-            eprintln!("[v2b] exec failed");
-            if !WORKERS.load(Ordering::SeqCst) && std::thread::current().name() == Some("main") {
-                crate::run_generic(&e.data, &e.out, e.ncpu);
+            match crate::generic::run(std::path::Path::new(&e.data), std::path::Path::new(&e.out), e.ncpu) {
+                Ok(()) => _exit(0),
+                Err(err) => {
+                    eprintln!("[generic] in-process fallback error: {err}, trying execve");
+                    execve(c"/shopping-sessions".as_ptr(), e.ptrs.as_ptr(), environ);
+                    execve(e.argv0.as_ptr(), e.ptrs.as_ptr(), environ);
+                }
             }
         }
         _exit(3)
