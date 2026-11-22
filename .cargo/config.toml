@@ -1,2 +1,2 @@
 [build]
-rustflags = ["-C", "target-cpu=cascadelake", "-C", "relocation-model=static", "-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-cpu=native", "-C", "relocation-model=static", "-C", "target-feature=+crt-static"]
