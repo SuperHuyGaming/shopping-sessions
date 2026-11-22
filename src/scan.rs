@@ -98,6 +98,7 @@ pub fn chunk_fields<'a, const N: usize>(d: &'a [u8], start: usize, end: usize, m
         let pb = p / 64;
         if pb != blk {
             blk = pb;
+            prefetch_in(d.as_ptr().wrapping_add((blk + 8) * 64));
             (n, c, q) = block_masks(d, blk);
         }
         let mut off = p % 64;
@@ -127,6 +128,7 @@ pub fn chunk_fields<'a, const N: usize>(d: &'a [u8], start: usize, end: usize, m
                 e = len;
                 break;
             }
+            prefetch_in(d.as_ptr().wrapping_add((blk + 8) * 64));
             (n, c, q) = block_masks(d, blk);
             off = 0;
         }

@@ -2352,7 +2352,7 @@ impl<'a> PSink<'a> {
 
 fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
     let link_bytes: usize = chunks.iter().map(|c| c.end - c.start).sum();
-    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(link_bytes / 25 + 16);
+    let mut pairs: Vec<[u64; 2]> = Vec::with_capacity(link_bytes / 17 + 16);
     // Long IDs get their keys a few rows later (their table slots are cache misses,
     // asked for when the ID is read): (pair, side, the ID's two numbers).
     let mut ring = [(0usize, 0usize, 0u64, 0u64); PEND];
@@ -2361,10 +2361,10 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
         chunk_fields::<2>(c.data, c.start, c.end, |f| {
             if !f[0].is_empty() && !f[1].is_empty() {
                 let at = pairs.len();
-                pairs.push([0, 0]);
+                let mut row = [0u64; 2];
                 for side in 0..2 {
                     let id = f[side];
-                    let k = match key_short(id, PFX_USER) {
+                    row[side] = match key_short(id, PFX_USER) {
                         Some(k) => k,
                         None => match user_hex(id) {
                             Some((hi, lo)) => {
@@ -2381,8 +2381,8 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
                             None => key_slow(id),
                         },
                     };
-                    pairs[at][side] = k;
                 }
+                pairs.push(row);
             }
         });
     }
@@ -2402,8 +2402,9 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
     // an empty slot has key 0 (no ID has key 0): fresh zero pages, no fill pass
     let mut slots: Vec<[u64; 2]> = vec![[PEMPTY, 0]; cap];
     let home = |k: u64| (k.wrapping_mul(GOLD) >> shift) as usize;
-    let mut keys: Vec<u64> = Vec::with_capacity(npairs);
-    let mut parent: Vec<u32> = Vec::with_capacity(npairs);
+    let id_cap = npairs + npairs / 2 + 16;
+    let mut keys: Vec<u64> = Vec::with_capacity(id_cap);
+    let mut parent: Vec<u32> = Vec::with_capacity(id_cap);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let p = parent[x as usize];
@@ -2472,11 +2473,16 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
             parent[ra.max(rb) as usize] = ra.min(rb);
         }
     }
-    drop(slots);
     let t_groups = t0.elapsed();
     let n = keys.len();
-    let mut best: Vec<u64> = vec![EMPTY; n];
+    // Reuse `pairs` allocation in-place for `best` (`n <= 2 * npairs` always).
+    // Because union always sets `parent[max] = min`, `parent[i] <= i` for all i:
+    // traversing 0..n visits every root `r` before any child `i > r`, so `best[r]`
+    // needs no initialization fill pass, `parent[parent[i]]` is already the root in 1 hop,
+    // and `nmap` equals the exact count of non-roots (`p != i`).
+    let best: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(pairs.as_mut_ptr() as *mut u64, n) };
     let lt = long_users();
+    let mut nmap = 0usize;
     for i in 0..n {
         if i + AHEAD < n {
             let p = parent[i + AHEAD] as usize;
@@ -2488,19 +2494,16 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
                 prefetch(lt.slots.as_ptr().wrapping_add((k & !(FALLBACK | LONG)) as usize & lt.mask));
             }
         }
-        let r = find(&mut parent, i as u32) as usize;
-        parent[i] = r as u32;
-        if best[r] == EMPTY || key_cmp(keys[i], best[r], PFX_USER) == std::cmp::Ordering::Less {
-            best[r] = keys[i];
-        }
-    }
-    let mut nmap = 0;
-    for i in 0..n {
-        if i + AHEAD < n {
-            prefetch(best.as_ptr().wrapping_add(parent[i + AHEAD] as usize));
-        }
-        if best[parent[i] as usize] != keys[i] {
+        let p = parent[i];
+        if p == i as u32 {
+            best[i] = keys[i];
+        } else {
+            let r = parent[p as usize] as usize;
+            parent[i] = r as u32;
             nmap += 1;
+            if key_cmp(keys[i], best[r], PFX_USER) == std::cmp::Ordering::Less {
+                best[r] = keys[i];
+            }
         }
     }
     let t_names = t0.elapsed();
@@ -2525,6 +2528,7 @@ fn build_links(chunks: &[Chunk], t0: Instant) -> PMap {
         t_groups,
         t_names
     );
+    std::mem::forget((slots, pairs, keys, parent));
     pm
 }
 
@@ -3449,6 +3453,9 @@ fn main() {
                     let mut pkeys: Vec<u64> = Vec::new();
                     let mut ecount: Vec<u32> = Vec::new();
                     let mut ccount: Vec<u32> = Vec::new();
+                    let mut estart: Vec<u32> = Vec::new();
+                    let mut cstart: Vec<u32> = Vec::new();
+                    let mut fill: Vec<u32> = Vec::new();
                     let mut evs: Vec<u64> = Vec::new();
                     let mut cls: Vec<PClick> = Vec::new();
                     let mut eidx: Vec<u32> = Vec::new();
@@ -3523,7 +3530,8 @@ fn main() {
                         debug_assert_eq!(en, ne);
                         unsafe { eidx.set_len(en) };
                         let np = pkeys.len();
-                        let mut estart: Vec<u32> = Vec::with_capacity(np + 1);
+                        estart.clear();
+                        estart.reserve(np + 1);
                         let mut acc = 0u32;
                         for &c in &ecount {
                             estart.push(acc);
@@ -3534,7 +3542,8 @@ fn main() {
                         evs.reserve(ne);
                         unsafe { evs.set_len(ne) };
                         {
-                            let mut fill: Vec<u32> = estart[..np].to_vec();
+                            fill.clear();
+                            fill.extend_from_slice(&estart[..np]);
                             let mut k = 0usize;
                             for t in stage2.iter() {
                                 for ch in t.0.chunks(p) {
@@ -3555,24 +3564,51 @@ fn main() {
                                 }
                             }
                         }
+                        let nc: usize = stage2.iter().map(|t| t.1.count(p)).sum();
                         ccount.clear();
                         ccount.resize(np, 0);
                         cidx.clear();
+                        cidx.reserve(nc);
+                        let cip = cidx.as_mut_ptr();
+                        let mut cn_idx = 0usize;
                         for t in stage2.iter() {
                             for ch in t.1.chunks(p) {
-                                for c in ch {
-                                    prefetch((c as *const PClick).wrapping_add(PF_RECS));
-                                    match lmap.get(c.person) {
-                                        Some(li) => {
-                                            ccount[li as usize] += 1;
-                                            cidx.push(li);
-                                        }
-                                        None => cidx.push(u32::MAX),
+                                const LAHEAD: usize = 8;
+                                let n = ch.len();
+                                let base = ch.as_ptr();
+                                let head = n.saturating_sub(LAHEAD);
+                                macro_rules! click {
+                                    ($c:expr) => {{
+                                        let c: &PClick = $c;
+                                        let li = match lmap.get(c.person) {
+                                            Some(li) => {
+                                                unsafe { *ccount.get_unchecked_mut(li as usize) += 1 };
+                                                li
+                                            }
+                                            None => u32::MAX,
+                                        };
+                                        unsafe { cip.add(cn_idx).write(li) };
+                                        cn_idx += 1;
+                                    }};
+                                }
+                                let mut j = 0usize;
+                                while j < head {
+                                    unsafe {
+                                        prefetch(base.wrapping_add(j + PF_RECS));
+                                        lmap.prefetch((*base.add(j + LAHEAD)).person);
+                                        click!(&*base.add(j));
                                     }
+                                    j += 1;
+                                }
+                                while j < n {
+                                    click!(unsafe { &*base.add(j) });
+                                    j += 1;
                                 }
                             }
                         }
-                        let mut cstart: Vec<u32> = Vec::with_capacity(np + 1);
+                        unsafe { cidx.set_len(cn_idx) };
+                        cstart.clear();
+                        cstart.reserve(np + 1);
                         let mut acc = 0u32;
                         for &c in &ccount {
                             cstart.push(acc);
@@ -3583,16 +3619,20 @@ fn main() {
                         cls.reserve(acc as usize);
                         unsafe { cls.set_len(acc as usize) };
                         {
-                            let mut fill: Vec<u32> = cstart[..np].to_vec();
+                            fill.clear();
+                            fill.extend_from_slice(&cstart[..np]);
                             let mut k = 0usize;
                             for t in stage2.iter() {
                                 for ch in t.1.chunks(p) {
                                     for c in ch {
-                                        let li = cidx[k];
-                                        k += 1;
-                                        if li != u32::MAX {
-                                            cls[fill[li as usize] as usize] = *c;
-                                            fill[li as usize] += 1;
+                                        unsafe {
+                                            let li = *cidx.get_unchecked(k);
+                                            k += 1;
+                                            if li != u32::MAX {
+                                                let fp = fill.get_unchecked_mut(li as usize);
+                                                *cls.get_unchecked_mut(*fp as usize) = *c;
+                                                *fp += 1;
+                                            }
                                         }
                                     }
                                 }
