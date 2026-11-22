@@ -629,21 +629,69 @@ fn key16(s: S) -> (u64, u64) {
         (x, 0)
     }
 }
+/// Exact compact user key (lo, hi, tag); tag == 0 means "cold" (only the byte slice identifies it).
+/// tier 1: 1..=16 bytes -> key16 words, tag = len (1..=16)
+/// tier 2: 33 bytes = any prefix byte + 32 lowercase hex -> 128-bit decode, tag = 33 | prefix << 8 | 1 << 16
+/// Tags of the two tiers never coincide and each tier's encoding is injective, so (lo, hi, tag) equality
+/// is exactly byte equality of the ids.
+#[inline(always)]
+fn ukey(s: S) -> (u64, u64, u32) {
+    let n = s.len();
+    if n.wrapping_sub(1) < 16 {
+        let (a, b) = key16(s);
+        return (a, b, n as u32);
+    }
+    if n == 33 {
+        let h: &[u8; 32] = s[1..33].try_into().unwrap();
+        let (mut a, mut b, mut bad) = (0u64, 0u64, 0u8);
+        for i in 0..16 {
+            let (d, v) = hexv(h[i]);
+            bad |= d;
+            a = (a << 4) | v;
+        }
+        for i in 16..32 {
+            let (d, v) = hexv(h[i]);
+            bad |= d;
+            b = (b << 4) | v;
+        }
+        if bad == 0 {
+            return (a, b, 33 | (s[0] as u32) << 8 | 1 << 16);
+        }
+    }
+    (0, 0, 0)
+}
+/// lowercase hex digit -> (0, value); anything else -> (1, _)
+#[inline(always)]
+fn hexv(c: u8) -> (u8, u64) {
+    let d = c.wrapping_sub(b'0');
+    let l = c.wrapping_sub(b'a');
+    if d < 10 {
+        (0, d as u64)
+    } else if l < 6 {
+        (0, l as u64 + 10)
+    } else {
+        (1, 0)
+    }
+}
+#[inline(always)]
+fn uhash(lo: u64, hi: u64, tag: u32) -> u64 {
+    hash16(lo, hi ^ ((tag as u64) << 40))
+}
 impl PTab {
     fn insert(&mut self, id: S, pid: u32) {
-        if id.len() > 16 || id.is_empty() {
+        let (lo, hi, tag) = ukey(id);
+        if tag == 0 {
             self.long.insert(id, pid);
             return;
         }
-        let (lo, hi) = key16(id);
-        let mut i = (hash16(lo, hi) as usize) & self.mask;
+        let mut i = (uhash(lo, hi, tag) as usize) & self.mask;
         loop {
             let sl = &mut self.slots[i];
             if sl.len == 0 {
-                *sl = Slot { lo, hi, pid, len: id.len() as u32 };
+                *sl = Slot { lo, hi, pid, len: tag };
                 return;
             }
-            if sl.len as usize == id.len() && sl.lo == lo && sl.hi == hi {
+            if sl.len == tag && sl.lo == lo && sl.hi == hi {
                 return;
             }
             i = (i + 1) & self.mask;
@@ -651,25 +699,25 @@ impl PTab {
     }
     #[inline(always)]
     fn get(&self, u: S) -> Option<u32> {
-        if u.len() > 16 || u.is_empty() {
+        let (lo, hi, tag) = ukey(u);
+        if tag == 0 {
             return self.long.get(u).copied();
         }
-        let (lo, hi) = key16(u);
-        let mut i = (hash16(lo, hi) as usize) & self.mask;
+        let mut i = (uhash(lo, hi, tag) as usize) & self.mask;
         loop {
             let sl = &self.slots[i];
             if sl.len == 0 {
                 return None;
             }
-            if sl.len as usize == u.len() && sl.lo == lo && sl.hi == hi {
+            if sl.len == tag && sl.lo == lo && sl.hi == hi {
                 return Some(sl.pid);
             }
             i = (i + 1) & self.mask;
         }
     }
     #[inline(always)]
-    fn get_precomputed(&self, u: S, h: u64, lo: u64, hi: u64) -> Option<u32> {
-        if u.len() > 16 || u.is_empty() {
+    fn get_precomputed(&self, u: S, h: u64, lo: u64, hi: u64, tag: u32) -> Option<u32> {
+        if tag == 0 {
             return self.long.get(u).copied();
         }
         let mut i = (h as usize) & self.mask;
@@ -678,7 +726,7 @@ impl PTab {
             if sl.len == 0 {
                 return None;
             }
-            if sl.len as usize == u.len() && sl.lo == lo && sl.hi == hi {
+            if sl.len == tag && sl.lo == lo && sl.hi == hi {
                 return Some(sl.pid);
             }
             i = (i + 1) & self.mask;
@@ -726,23 +774,18 @@ impl Interner {
 
     #[inline(always)]
     fn intern(&self, u: S) -> u32 {
-        if u.len() > 16 || u.is_empty() {
-            let mut fb = self.fallback.lock().unwrap();
-            let next = &self.next_pid;
-            return *fb.entry(u).or_insert_with(|| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        }
-        let (lo, hi) = key16(u);
-        self.intern_precomputed(u, hash16(lo, hi), lo, hi)
+        let (lo, hi, tag) = ukey(u);
+        self.intern_precomputed(u, uhash(lo, hi, tag), lo, hi, tag)
     }
 
     #[inline(always)]
-    fn intern_precomputed(&self, u: S, h: u64, lo: u64, hi: u64) -> u32 {
-        if u.len() > 16 || u.is_empty() {
+    fn intern_precomputed(&self, u: S, h: u64, lo: u64, hi: u64, tag: u32) -> u32 {
+        if tag == 0 {
             let mut fb = self.fallback.lock().unwrap();
             let next = &self.next_pid;
             return *fb.entry(u).or_insert_with(|| next.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         }
-        let len = u.len() as u32;
+        let len = tag;
         let mut i = (h as usize) & self.mask;
         let mut probes = 0;
         loop {
@@ -786,11 +829,11 @@ impl Interner {
 }
 
 #[inline(always)]
-fn resolve_precomputed(ptab: &PTab, interner: &Interner, u: S, h: u64, lo: u64, hi: u64) -> u32 {
-    if let Some(pid) = ptab.get_precomputed(u, h, lo, hi) {
+fn resolve_precomputed(ptab: &PTab, interner: &Interner, u: S, h: u64, lo: u64, hi: u64, tag: u32) -> u32 {
+    if let Some(pid) = ptab.get_precomputed(u, h, lo, hi, tag) {
         pid
     } else {
-        interner.intern_precomputed(u, h, lo, hi)
+        interner.intern_precomputed(u, h, lo, hi, tag)
     }
 }
 
@@ -815,7 +858,7 @@ fn build_names(interner: &Interner, root_names: &[S]) -> Vec<S> {
     for sl in &interner.slots {
         if sl.state.load(std::sync::atomic::Ordering::Acquire) == 2 {
             let r = std::sync::atomic::Ordering::Relaxed;
-            let u = unsafe { std::slice::from_raw_parts(sl.ptr.load(r) as *const u8, sl.len.load(r) as usize) };
+            let u = unsafe { std::slice::from_raw_parts(sl.ptr.load(r) as *const u8, (sl.len.load(r) & 0xFF) as usize) };
             names[sl.pid.load(r) as usize] = u;
         }
     }
@@ -1017,6 +1060,7 @@ fn main() {
                 user_h: u64,
                 lo: u64,
                 hi: u64,
+                tag: u32,
                 ts: i64,
                 cat: u32,
                 price: i64,
@@ -1031,6 +1075,7 @@ fn main() {
                 user_h: 0,
                 lo: 0,
                 hi: 0,
+                tag: 0,
                 ts: 0,
                 cat: INVALID,
                 price: 0,
@@ -1051,7 +1096,7 @@ fn main() {
                     let mut flush_events = |batch: &[EventBatchItem; EVENT_BATCH], len: usize, payload: &mut Vec<EventPayload>, out: &mut Vec<Vec<EvKey>>| {
                         if len == 0 { return; }
                         for item in &batch[..len] {
-                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                            if item.valid && item.tag != 0 {
                                 let slot_ptab = (item.user_h as usize) & ptab.mask;
                                 let slot_intern = (item.user_h as usize) & interner_ref.mask;
                                 unsafe {
@@ -1066,7 +1111,7 @@ fn main() {
 
                         for item in &batch[..len] {
                             let rec = if item.valid {
-                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi, item.tag);
                                 let ts_rel = (item.ts - base_ms) as u64;
                                 let key = ((pid as u64) << 40) | ts_rel;
                                 let cat_price = ((item.cat as u64) << 32) | (item.price as u32 as u64);
@@ -1092,6 +1137,7 @@ fn main() {
                             let mut user_h = 0u64;
                             let mut lo = 0u64;
                             let mut hi = 0u64;
+                            let mut tag = 0u32;
                             let mut ts = 0i64;
                             let mut cat = INVALID;
                             let mut price = 0i64;
@@ -1113,10 +1159,11 @@ fn main() {
                                                 let pr = if et == 3 { parse_price(f[6]) } else { 0 };
                                                 if et != 3 || pr >= 1 {
                                                     user = u;
-                                                    let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                    let (l, h_val, tg) = ukey(u);
                                                     lo = l;
                                                     hi = h_val;
-                                                    user_h = hash16(lo, hi);
+                                                    tag = tg;
+                                                    user_h = uhash(lo, hi, tg);
                                                     ts = t;
                                                     price = pr;
                                                     cat = if et == 3 { *prod_cat.get(prod).unwrap_or(&unknown) } else { u32::MAX };
@@ -1136,6 +1183,7 @@ fn main() {
                                 user_h,
                                 lo,
                                 hi,
+                                tag,
                                 ts,
                                 cat,
                                 price,
@@ -1160,11 +1208,31 @@ fn main() {
                 .into_par_iter()
                 .map(|b| {
                     let n: usize = keys_per_chunk.iter().map(|k| k[b].len()).sum();
-                    let mut keys: Vec<EvKey> = Vec::with_capacity(n);
-                    for k in &keys_per_chunk {
-                        keys.extend_from_slice(&k[b]);
+                    // Linear-time dedup filter. Pass 1: two bitmaps indexed by the low bits of h (the top 8 bits
+                    // chose this bucket): `seen` = some record hit this bit, `dup` = at least two records did.
+                    // Pass 2: a record whose `dup` bit is clear shares h with no other record, hence its event_id
+                    // is unique and it is emitted directly. Only `dup` records (true duplicates + bitmap/hash
+                    // collisions, a small fraction) go through the exact sort-based grouping below.
+                    let mut mbits = 1usize << 12;
+                    while mbits < n * 8 {
+                        mbits <<= 1;
                     }
-                    keys.sort_unstable_by_key(|k| (k.h, k.ingest, k.loc));
+                    let mmask = (mbits - 1) as u64;
+                    let mut seen = vec![0u64; mbits / 64];
+                    let mut dupb = vec![0u64; mbits / 64];
+                    for k in &keys_per_chunk {
+                        for e in &k[b] {
+                            let x = e.h & mmask;
+                            let (w, bit) = ((x >> 6) as usize, 1u64 << (x & 63));
+                            unsafe {
+                                let sw = seen.get_unchecked_mut(w);
+                                let sv = *sw;
+                                *sw = sv | bit;
+                                *dupb.get_unchecked_mut(w) |= sv & bit;
+                            }
+                        }
+                    }
+                    drop(seen);
                     let mut surv = Vec::with_capacity(n);
                     let mut cnt = [0u32; NB2];
                     let mut emit = |p: &EventPayload| {
@@ -1172,6 +1240,22 @@ fn main() {
                         cnt[pb_idx] += 1;
                         surv.push(p.rec);
                     };
+                    let mut keys: Vec<EvKey> = Vec::with_capacity(n / 4 + 16);
+                    for k in &keys_per_chunk {
+                        for e in &k[b] {
+                            let x = e.h & mmask;
+                            if (unsafe { *dupb.get_unchecked((x >> 6) as usize) } >> (x & 63)) & 1 == 0 {
+                                let p = &payloads_ref[(e.loc >> 32) as usize][(e.loc as u32) as usize];
+                                if p.rec.is_valid() {
+                                    emit(p);
+                                }
+                            } else {
+                                keys.push(*e);
+                            }
+                        }
+                    }
+                    drop(dupb);
+                    keys.sort_unstable_by_key(|k| (k.h, k.ingest, k.loc));
                     let mut s = 0;
                     while s < keys.len() {
                         let mut e = s + 1;
@@ -1286,6 +1370,7 @@ fn main() {
                 user_h: u64,
                 lo: u64,
                 hi: u64,
+                tag: u32,
                 camp: u32,
                 ts: i64,
                 valid: bool,
@@ -1297,6 +1382,7 @@ fn main() {
                 user_h: 0,
                 lo: 0,
                 hi: 0,
+                tag: 0,
                 camp: 0,
                 ts: 0,
                 valid: false,
@@ -1314,7 +1400,7 @@ fn main() {
                     let mut flush_clicks = |batch: &[ClickBatchItem; CLICK_BATCH], len: usize, cnt: &mut [u32; NB2], surv: &mut Vec<CkRec>| {
                         if len == 0 { return; }
                         for item in &batch[..len] {
-                            if item.valid && item.user.len() <= 16 && !item.user.is_empty() {
+                            if item.valid && item.tag != 0 {
                                 let slot_ptab = (item.user_h as usize) & ptab.mask;
                                 let slot_intern = (item.user_h as usize) & interner_ref.mask;
                                 unsafe {
@@ -1329,7 +1415,7 @@ fn main() {
 
                         for item in &batch[..len] {
                             if item.valid {
-                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi);
+                                let pid = resolve_precomputed(ptab, interner_ref, item.user, item.user_h, item.lo, item.hi, item.tag);
                                 let ts_rel = (item.ts - base_ms) as u64;
                                 let key = ((pid as u64) << 40) | ts_rel;
                                 let p = (pid & 255) as usize;
@@ -1347,6 +1433,7 @@ fn main() {
                             let mut user_h = 0u64;
                             let mut lo = 0u64;
                             let mut hi = 0u64;
+                            let mut tag = 0u32;
                             let mut camp = 0u32;
                             let mut ts = 0i64;
 
@@ -1356,10 +1443,11 @@ fn main() {
                                         if t >= ws - WEEK && t < we {
                                             if let Some(&cmp) = camp_id.get(c) {
                                                 user = u;
-                                                let (l, h_val) = if u.len() <= 16 { key16(u) } else { (0, 0) };
+                                                let (l, h_val, tg) = ukey(u);
                                                 lo = l;
                                                 hi = h_val;
-                                                user_h = hash16(lo, hi);
+                                                tag = tg;
+                                                user_h = uhash(lo, hi, tg);
                                                 camp = cmp;
                                                 ts = t;
                                                 valid = true;
@@ -1375,6 +1463,7 @@ fn main() {
                                 user_h,
                                 lo,
                                 hi,
+                                tag,
                                 camp,
                                 ts,
                                 valid,
