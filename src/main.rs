@@ -349,7 +349,7 @@ fn main() {
     } else {
         sys::SPIN_TICKS.store(SPIN_US_DEFAULT * 2000, std::sync::atomic::Ordering::Relaxed);
     }
-    sys::PIN_AT_START.store(parse::pin_mode() == 2 && std::env::var("XL_PINSTART").is_ok_and(|v| v == "1"), std::sync::atomic::Ordering::Relaxed);
+    sys::PIN_AT_START.store(parse::pin_mode() == 2 && std::env::var("XL_PINSTART").map_or(true, |v| v != "0"), std::sync::atomic::Ordering::Relaxed);
     if std::env::var("XL_NOTOUCH").is_ok_and(|v| v == "0") {
         sys::CORE_NOTOUCH.store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -420,7 +420,7 @@ fn main() {
             }
             eprintln!("[v3b] setup ms: {s}; exit at {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
         }
-        match std::env::var("XL_PMX").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2) {
+        match std::env::var("XL_PMX").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0) {
             1 => sys::exit_release(g.nt, unsafe { &parse::FDS }),
             2 => sys::exit_release_pieces(g.nt, unsafe { &parse::FDS }),
             _ => {}
@@ -499,8 +499,8 @@ fn main() {
     #[cfg(feature = "tl")]
     let rel0 = sys::tl::now();
     let endrel = std::env::var("XL_ENDREL").ok();
-    let many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
-    let endrel_ran = ((sys::SMALLPAGES.load(std::sync::atomic::Ordering::Relaxed) || many_faults) && endrel.as_deref().map_or(true, |v| v == "1")) || endrel.as_deref() == Some("2");
+    let _many_faults = endrel.is_none() && sys::minflt(0) as usize > 2 * (g.files.last().map_or(0, |f| f.off + f.len) >> 16) + 60_000;
+    let endrel_ran = endrel.as_deref().map_or(false, |v| v == "1" || v == "2");
     if endrel_ran {
         let nt = g.nt;
         let mut r = [[(0usize, 0usize); 12]; 16];
@@ -598,7 +598,7 @@ fn main() {
         }
     }
     sys::xm(62);
-    if !endrel_ran && std::env::var("XL_XREL").map_or(true, |v| v != "0") {
+    if !endrel_ran && std::env::var("XL_XREL").is_ok_and(|v| v == "1") {
         sys::exit_release(g.nt, unsafe { &parse::FDS });
     }
     sys::xm_end();
