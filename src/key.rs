@@ -111,19 +111,39 @@ unsafe fn pack_simd(ptr: *const u8, n: usize) -> Option<u64> {
     Some((head << 12) | tail)
 }
 
-struct Interner {
+const SHARDS: usize = 64;
+const LOCAL_MASK: u64 = (1 << 26) - 1;
+
+struct Shard {
     index: HashMap<Box<[u8]>, u32>,
     bytes: Vec<Box<[u8]>>,
 }
 
-fn interner() -> &'static Mutex<Interner> {
-    static INTERNER: OnceLock<Mutex<Interner>> = OnceLock::new();
+struct ShardedInterner {
+    shards: [Mutex<Shard>; SHARDS],
+}
+
+fn sharded_interner() -> &'static ShardedInterner {
+    static INTERNER: OnceLock<ShardedInterner> = OnceLock::new();
     INTERNER.get_or_init(|| {
-        Mutex::new(Interner {
-            index: HashMap::new(),
-            bytes: Vec::new(),
-        })
+        let shards = std::array::from_fn(|_| {
+            Mutex::new(Shard {
+                index: HashMap::new(),
+                bytes: Vec::new(),
+            })
+        });
+        ShardedInterner { shards }
     })
+}
+
+#[inline]
+fn fnv1a(bytes: &[u8]) -> usize {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as usize) % SHARDS
 }
 
 /// The key of a non-empty ID.
@@ -137,22 +157,26 @@ pub fn key(bytes: &[u8]) -> u64 {
 
 #[cold]
 fn intern(bytes: &[u8]) -> u64 {
-    let mut guard = interner().lock().unwrap();
+    let shard_idx = fnv1a(bytes);
+    let mut guard = sharded_interner().shards[shard_idx].lock().unwrap();
     if let Some(&i) = guard.index.get(bytes) {
-        return ESCAPE | i as u64;
+        return ESCAPE | ((shard_idx as u64) << 26) | (i as u64);
     }
     let i = guard.bytes.len() as u32;
     let boxed: Box<[u8]> = bytes.into();
     guard.bytes.push(boxed.clone());
     guard.index.insert(boxed, i);
-    ESCAPE | i as u64
+    ESCAPE | ((shard_idx as u64) << 26) | (i as u64)
 }
 
 /// Appends the ID's bytes to `out`.
 pub fn bytes_into(key: u64, out: &mut Vec<u8>) {
     if key & ESCAPE != 0 {
-        let guard = interner().lock().unwrap();
-        out.extend_from_slice(&guard.bytes[(key & !ESCAPE) as usize]);
+        let payload = key & !ESCAPE;
+        let shard_idx = ((payload >> 26) as usize) % SHARDS;
+        let local_i = (payload & LOCAL_MASK) as usize;
+        let guard = sharded_interner().shards[shard_idx].lock().unwrap();
+        out.extend_from_slice(&guard.bytes[local_i]);
     } else {
         let mut shift = 54i32;
         while shift >= 0 {
