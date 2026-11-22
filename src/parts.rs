@@ -70,19 +70,22 @@ impl<T: Copy> Parts<T> {
     /// from now: the next writes to the same partition come many rows later, so the
     /// line (fresh memory, otherwise a miss on every new line) is there by then.
     #[inline(always)]
-    pub fn push_pf(&mut self, p: usize, x: T, ahead: usize) {
+    pub fn push_pf(&mut self, p: usize, x: T, ahead: usize) -> *mut T {
         let (c, l) = unsafe { *self.st.get_unchecked(p) };
         if l as usize == self.ch {
             self.new_chunk(p);
-            unsafe { self.st[p].0.write(x) };
+            let d = self.st[p].0;
+            unsafe { d.write(x) };
             self.st[p].1 = 1;
-            prefetch_w(self.st[p].0.wrapping_add(1));
+            prefetch_w(d.wrapping_add(ahead));
+            d
         } else {
             unsafe {
                 let d = c.add(l as usize);
                 d.write(x);
                 self.st.get_unchecked_mut(p).1 = l + 1;
                 prefetch_w(d.wrapping_add(ahead));
+                d
             }
         }
     }

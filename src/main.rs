@@ -911,8 +911,7 @@ fn tod_checked(w: u64) -> Option<u64> {
 /// Per-thread cache of validated dates ("YYYY-MM-DD" -> day number). A dataset has
 /// only a few dozen distinct dates, so each timestamp mostly parses only its time.
 struct DateCache {
-    keys: [u64; 256],
-    days: [i64; 256],
+    entries: [(u64, i64); 256],
     /// first numbers of the long event IDs this thread parsed (`eid_key`)
     long_hi: Vec<u64>,
     /// this thread's number, below EREF_MAX_THREADS
@@ -923,7 +922,7 @@ struct DateCache {
 
 impl DateCache {
     fn new() -> Self {
-        DateCache { keys: [0; 256], days: [i64::MIN; 256], long_hi: Vec::new(), tid: 0, pend: Pending::new() }
+        DateCache { entries: [(0, i64::MIN); 256], long_hi: Vec::new(), tid: 0, pend: Pending::new() }
     }
 
     /// Same result as dt19_swar(p).
@@ -931,12 +930,6 @@ impl DateCache {
     fn dt19(&mut self, p: *const u8) -> Option<i64> {
         const MA: u64 = 0x00FF_FF00_FFFF_FFFF;
         const SA: u64 = 0x2D00_002D_0000_0000;
-        // bytes 8..16 = D D T H H : M M ; time digits at 3,4,6,7
-        const SBT: u64 = 0x0000_3A00_0054_0000;
-        const MBT: u64 = 0xFFFF_00FF_FF00_0000;
-        const MBX: u64 = 0xFFFF_00FF_FF00_FFFF;
-        const MC: u64 = 0x00FF_FF00;
-        const SC: u64 = 0x0000_003A;
         let a = rd64(p);
         if (a & !MA) != SA {
             return None;
@@ -944,14 +937,13 @@ impl DateCache {
         let b = rd64(unsafe { p.add(8) });
         let key = (a & MA) | ((b & 0xFF) << 32) | (((b >> 8) & 0xFF) << 56);
         let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
-        let days = if self.keys[idx] == key && self.days[idx] != i64::MIN {
-            self.days[idx]
+        let days = if self.entries[idx].0 == key && self.entries[idx].1 != i64::MIN {
+            self.entries[idx].1
         } else {
             // validate the whole value the slow way, then cache its date
             let v = dt19_swar(p)?;
             let d = v.div_euclid(86_400_000);
-            self.keys[idx] = key;
-            self.days[idx] = d;
+            self.entries[idx] = (key, d);
             d
         };
         // byte 10 is 'T', bytes 11..19 are "HH:MM:SS"
@@ -1021,9 +1013,10 @@ impl DateCache {
             let b = rd64(unsafe { p.add(8) });
             let key = (a & MA) | ((b & 0xFF) << 32) | (((b >> 8) & 0xFF) << 56);
             let idx = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
-            if self.keys[idx] == key && self.days[idx] != i64::MIN {
+            let (k, d) = self.entries[idx];
+            if k == key && d != i64::MIN {
                 let tod = tod_of_lanes(hms_lanes(rd64(unsafe { p.add(11) })));
-                let secs = self.days[idx] * 86_400 + tod as i64;
+                let secs = d * 86_400 + tod as i64;
                 return (secs, secs * 1000);
             }
             if let Some(v) = self.dt19(p) {
@@ -2024,9 +2017,15 @@ fn radix_sort_ts(e: &mut [u64], tmp: &mut Vec<u64>) {
         cnt[2][(t >> 16) & 255] += 1;
         cnt[3][t >> 24] += 1;
     }
+    let first_elem = e[0];
     let mut src: *mut u64 = e.as_mut_ptr();
     let mut dst: *mut u64 = tmp.as_mut_ptr();
+    let mut swapped = false;
     for d in 0..4 {
+        let b = ((first_elem >> (32 + 8 * d)) & 255) as usize;
+        if cnt[d][b] == n as u32 {
+            continue;
+        }
         let c = &mut cnt[d];
         let mut acc = 0u32;
         for v in c.iter_mut() {
@@ -2045,8 +2044,13 @@ fn radix_sort_ts(e: &mut [u64], tmp: &mut Vec<u64>) {
             }
         }
         std::mem::swap(&mut src, &mut dst);
+        swapped = !swapped;
     }
-    // four passes: the result is back in e
+    if swapped {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, e.as_mut_ptr(), n);
+        }
+    }
 }
 
 
@@ -2093,10 +2097,15 @@ trait EvSink {
     fn slot(&mut self, eid: u64) -> *mut EvRec;
     fn commit(&mut self, eid: u64, d: *mut EvRec);
     #[inline(always)]
-    fn put(&mut self, r: EvRec) {
-        let d = self.slot(r.eid);
+    fn push_rec(&mut self, eid: u64, r: EvRec) -> *mut EvRec {
+        let d = self.slot(eid);
         unsafe { d.write(r) };
-        self.commit(r.eid, d);
+        self.commit(eid, d);
+        d
+    }
+    #[inline(always)]
+    fn put(&mut self, r: EvRec) {
+        self.push_rec(r.eid, r);
     }
 }
 
@@ -2116,6 +2125,10 @@ impl EvSink for PartSink {
     fn commit(&mut self, eid: u64, d: *mut EvRec) {
         // 32-byte records: ask for the line after the one just written
         self.ev.commit_pf((eid >> self.eshift) as usize, d, 2);
+    }
+    #[inline(always)]
+    fn push_rec(&mut self, eid: u64, r: EvRec) -> *mut EvRec {
+        self.ev.push_pf((eid >> self.eshift) as usize, r, 2)
     }
 }
 
@@ -2762,7 +2775,6 @@ fn parse_events<S: EvSink>(d: &[u8], start: usize, end: usize, cx: &PCtx, dc: &m
             slow!();
         }
         let (eid, eref) = eid_key(sl(eid_at, l0), dc);
-        let rec = sink.slot(eid);
         // a user ID that is not of the short form gets its key at the end of the row
         let user = if l1 != 0 {
             match key_short(sl(user_at, l1), PFX_USER) {
@@ -2778,11 +2790,6 @@ fn parse_events<S: EvSink>(d: &[u8], start: usize, end: usize, cx: &PCtx, dc: &m
             None => i64::MIN,
         };
         let inw = (tsv.wrapping_sub(ws) as u64) < span;
-        unsafe {
-            (*rec).eid = eid;
-            (*rec).user = user;
-            (*rec).ts = tsv.wrapping_sub(tb) as u32;
-        }
         // window 1: ingest_ts, event_type, product_id, price_cents
         let (n1, c1, q1) = masks64(full, p2);
         let s1 = n1 | c1;
@@ -2843,9 +2850,16 @@ fn parse_events<S: EvSink>(d: &[u8], start: usize, end: usize, cx: &PCtx, dc: &m
             pck = price | (cat as u32) << 24 | (kind as u32) << 30;
         }
         unsafe {
-            (*rec).pck = pck;
             if pck < PCK_INVALID {
-                (*rec).ing = if same_day { ING_LAZY | eref << 24 | tod_nibbles(rd64(ing_at.add(11))) } else { ing | eref << 32 };
+                let ing_val = if same_day { ING_LAZY | eref << 24 | tod_nibbles(rd64(ing_at.add(11))) } else { ing | eref << 32 };
+                let r = EvRec {
+                    eid,
+                    user,
+                    ing: ing_val,
+                    ts: tsv.wrapping_sub(tb) as u32,
+                    pck,
+                };
+                let rec = sink.push_rec(eid, r);
                 if user == USER_PENDING {
                     let id = sl(user_at, l1);
                     match user_hex(id) {
@@ -2855,12 +2869,17 @@ fn parse_events<S: EvSink>(d: &[u8], start: usize, end: usize, cx: &PCtx, dc: &m
                     }
                 }
             } else {
-                (*rec).user = 0;
-                (*rec).ts = 0;
-                (*rec).ing = (if same_day { dc.ingest(sl(ing_at, l3)).0.clamp(0, u32::MAX as i64) as u64 } else { ing }) | eref << 32;
+                let ing_val = (if same_day { dc.ingest(sl(ing_at, l3)).0.clamp(0, u32::MAX as i64) as u64 } else { ing }) | eref << 32;
+                let r = EvRec {
+                    eid,
+                    user: 0,
+                    ing: ing_val,
+                    ts: 0,
+                    pck,
+                };
+                sink.push_rec(eid, r);
             }
         }
-        sink.commit(eid, rec);
     }
     dc.pend.drain();
 }
@@ -3096,7 +3115,7 @@ fn main() {
     }
     // The parsed input files, in pieces of 32 MB: page tables to drop (see `unmap_pages`).
     const ZAP_TASK: usize = 32 << 20;
-    if std::env::var_os("NOZAP").is_none() {
+    if std::env::var_os("ZAP").is_some() {
         let mut seen = 0usize;
         for c in chunks.iter() {
             let base = c.data.as_ptr() as usize;
