@@ -302,9 +302,29 @@ fn hex32(p: *const u8) -> Option<(u64, u64)> {
     Some((a << 32 | b, c << 32 | d))
 }
 
+#[inline(always)]
 fn hex16_into(out: &mut Vec<u8>, v: u64) {
-    for i in (0..16).rev() {
-        out.push(b"0123456789abcdef"[((v >> (4 * i)) & 15) as usize]);
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    unsafe {
+        use core::arch::x86_64::_pdep_u64;
+        const M: u64 = 0x0F0F_0F0F_0F0F_0F0F;
+        const SIX: u64 = 0x0606_0606_0606_0606;
+        const ONE: u64 = 0x0101_0101_0101_0101;
+        const ZERO: u64 = 0x3030_3030_3030_3030;
+        let hi_w = _pdep_u64(v >> 32, M);
+        let lo_w = _pdep_u64(v, M);
+        let hi_a = (hi_w + ZERO + (((hi_w + SIX) >> 4) & ONE) * 39).swap_bytes();
+        let lo_a = (lo_w + ZERO + (((lo_w + SIX) >> 4) & ONE) * 39).swap_bytes();
+        let mut buf = [0u8; 16];
+        std::ptr::write_unaligned(buf.as_mut_ptr() as *mut u64, hi_a);
+        std::ptr::write_unaligned(buf.as_mut_ptr().add(8) as *mut u64, lo_a);
+        out.extend_from_slice(&buf);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        for i in (0..16).rev() {
+            out.push(b"0123456789abcdef"[((v >> (4 * i)) & 15) as usize]);
+        }
     }
 }
 
@@ -2634,13 +2654,21 @@ struct UserCols {
 }
 
 impl UserCols {
-    fn new() -> Self {
-        UserCols { uid: Vec::new(), day: Vec::new(), sess: Vec::new(), ev: Vec::new(), rev: Vec::new(), top: Vec::new(), defs: Vec::new(), n: 0 }
+    fn with_capacity(cap: usize) -> Self {
+        UserCols {
+            uid: Vec::with_capacity(cap * 16),
+            day: Vec::with_capacity(cap),
+            sess: Vec::with_capacity(cap),
+            ev: Vec::with_capacity(cap),
+            rev: Vec::with_capacity(cap),
+            top: Vec::with_capacity(cap * 6),
+            defs: Vec::with_capacity(cap / 8 + 16),
+            n: 0,
+        }
     }
     #[inline(always)]
-    fn push(&mut self, name: &[u8], day: i32, s: i64, ev: i64, rev: i64, top: Option<&[u8]>) {
-        self.uid.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        self.uid.extend_from_slice(name);
+    fn push(&mut self, name_with_len: &[u8], day: i32, s: i64, ev: i64, rev: i64, top: Option<&[u8]>) {
+        self.uid.extend_from_slice(name_with_len);
         self.day.push(day);
         self.sess.push(s as i32);
         self.ev.push(ev as i32);
@@ -3443,9 +3471,10 @@ fn main() {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 let next = &next;
+                let ucap = est_rows / nthreads / 7 + 1024;
                 sc.spawn(move || {
-                    let mut cols = UserCols::new();
-                    let mut name: Vec<u8> = Vec::new();
+                    let mut cols = UserCols::with_capacity(ucap);
+                    let mut name: Vec<u8> = Vec::with_capacity(64);
                     let mut cacc = CampAcc::new((ncamp + 1) * ndays);
                     let mut lmap = LocalMap::new(pbits);
                     let mut sort_tmp: Vec<u64> = Vec::new();
@@ -3640,10 +3669,20 @@ fn main() {
                         }
                         stm[0] += st0.elapsed().as_secs_f64();
                         let st1 = Instant::now();
+                        let lt = long_users();
                         for li in 0..np {
+                            if li + 4 < np {
+                                let next_pk = unsafe { *pkeys.get_unchecked(li + 4) };
+                                if next_pk & (FALLBACK | LONG) == (FALLBACK | LONG) {
+                                    prefetch(lt.slots.as_ptr().wrapping_add((next_pk & !(FALLBACK | LONG)) as usize & lt.mask));
+                                }
+                            }
                             let pk = pkeys[li];
                             name.clear();
+                            name.extend_from_slice(&[0, 0, 0, 0]);
                             key_bytes(pk, PFX_USER, &mut name);
+                            let nlen = (name.len() - 4) as u32;
+                            name[..4].copy_from_slice(&nlen.to_le_bytes());
                             let name = &name[..];
                             let e = &mut evs[estart[li] as usize..estart[li + 1] as usize];
                             if xp(16) { continue; }
